@@ -1,0 +1,663 @@
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"raven/internal/api"
+	"raven/internal/connections"
+	"raven/internal/model"
+	"raven/internal/packs"
+	"raven/internal/pipeline"
+	"raven/internal/rawstore"
+)
+
+func setupTestServer(t *testing.T) (*api.Server, *rawstore.RawStore, *pipeline.Pipeline, string) {
+	t.Helper()
+	tempDir, err := os.MkdirTemp("", "raven_api_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+
+	dbPath := filepath.Join(tempDir, "raven.db")
+	store, err := rawstore.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create raw store: %v", err)
+	}
+
+	// Create test parser pack
+	packsDir := filepath.Join(tempDir, "packs")
+	_ = os.MkdirAll(packsDir, 0755)
+
+	samplePackYAML := `
+apiVersion: raven.io/v1
+kind: LogSource
+metadata:
+  name: test-firewall
+  version: 1.0.0
+  description: Test Firewall Pack
+  author: SecurityOps
+spec:
+  sourceCategory: network_device
+  format: syslog
+  match:
+    contains: "%ASA-6-302013"
+  fields:
+    src_ip:
+      from: src_ip
+      type: ip
+`
+	_ = os.WriteFile(filepath.Join(packsDir, "test-firewall.yaml"), []byte(samplePackYAML), 0644)
+	snap, err := packs.LoadDir(packsDir)
+	if err != nil {
+		t.Fatalf("failed to load packs: %v", err)
+	}
+	packMgr := packs.NewSnapshotManager(snap)
+
+	pipe := pipeline.New(pipeline.Config{
+		Workers:     2,
+		BufferSize:  100,
+		PackManager: packMgr,
+	}, store, nil)
+	pipe.Start()
+
+	mockFS := fstest.MapFS{
+		"index.html": {
+			Data: []byte("<!DOCTYPE html><html><body>RAVEN Test UI</body></html>"),
+		},
+		"assets/test.js": {
+			Data: []byte("console.log('test');"),
+		},
+	}
+
+	cfg := api.ConfigInfo{
+		SyslogUDP:  ":1514",
+		SyslogTCP:  ":1514",
+		HTTPIngest: ":8080",
+		InboxDir:   "data/inbox",
+		DBPath:     dbPath,
+		Workers:    2,
+	}
+
+	srv := api.NewServer("127.0.0.1:0", store, pipe, packMgr, packsDir, cfg, mockFS, "test-version")
+	return srv, store, pipe, tempDir
+}
+
+func TestAPI_HealthAndStats(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	handler := srv.Handler()
+
+	// 1. Health
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var health map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&health); err != nil {
+		t.Fatalf("failed to decode health: %v", err)
+	}
+	if health["status"] != "ok" || health["air_gapped"] != false || health["marketplace_online"] != false || health["version"] != "test-version" {
+		t.Fatalf("invalid health response: %+v", health)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var config map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&config); err != nil {
+		t.Fatalf("failed to decode config: %v", err)
+	}
+	if config["version"] != "test-version" {
+		t.Fatalf("expected standalone server version, got %+v", config["version"])
+	}
+
+	// 2. Stats
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var stats map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if _, ok := stats["loss_audit"]; !ok {
+		t.Fatalf("missing loss_audit in stats: %+v", stats)
+	}
+}
+
+func TestAPI_EventsAndTrace(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	// Insert an event
+	ctx := context.Background()
+	raw, err := store.Store(ctx, model.IngestedRecord{
+		Transport:  "udp",
+		SourceIP:   "192.168.1.10",
+		SourcePort: 514,
+		RawBytes:   []byte("<134>Sep 18 10:00:00 asa %ASA-6-302013: Built outbound TCP connection"),
+		ReceivedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to store raw: %v", err)
+	}
+
+	evt := &model.NormalizedEvent{
+		Raven: model.RavenEnvelope{
+			EventID:        "evt-test-123",
+			RawID:          raw.RawID,
+			RawSHA256:      raw.RawSHA256,
+			SourceCategory: "network_device",
+			SourceID:       "asa-fw-01",
+			ReceivedTime:   time.Now().UTC(),
+			Status:         "normalized",
+			ProcessingHistory: []model.ProcessingStep{
+				{Stage: "raw_commit", Result: "ok"},
+				{Stage: "format_detect", Result: "syslog"},
+			},
+		},
+		OCSF: map[string]any{
+			"activity_name": "Logon",
+			"severity_id":   3,
+			"unmapped": map[string]any{
+				"custom_flag": "val",
+			},
+		},
+	}
+	if err := store.StoreNormalized(ctx, evt); err != nil {
+		t.Fatalf("failed to store normalized: %v", err)
+	}
+
+	handler := srv.Handler()
+
+	// 1. List Events
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/events", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var listResp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&listResp)
+	if total, ok := listResp["total"].(float64); !ok || int(total) != 1 {
+		t.Fatalf("expected total 1, got %+v", listResp["total"])
+	}
+
+	// 2. Get Single Event
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/events/evt-test-123", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// 3. Event Trace
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/events/evt-test-123/trace", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var traceResp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&traceResp)
+	if traceResp["raw_id"] != raw.RawID {
+		t.Fatalf("trace raw_id mismatch: %+v", traceResp)
+	}
+	if traceResp["raw_hex"] == "" {
+		t.Fatalf("trace raw_hex empty")
+	}
+
+	// 4. Raw Verify
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/raw/"+raw.RawID+"/verify", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var verifyResp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&verifyResp)
+	if verifyResp["matches"] != true || verifyResp["status"] != "PASSED" {
+		t.Fatalf("expected verify PASSED, got %+v", verifyResp)
+	}
+}
+
+func TestAPI_PacksValidationAndManagement(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	handler := srv.Handler()
+
+	// 1. List packs
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/packs", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var packsResp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&packsResp)
+	packsList := packsResp["packs"].([]any)
+	if len(packsList) != 1 {
+		t.Fatalf("expected 1 pack, got %d", len(packsList))
+	}
+
+	// 2. Validate pack
+	validYAML := `
+apiVersion: raven.io/v1
+kind: LogSource
+metadata:
+  name: test-ssh
+  version: 1.0.0
+spec:
+  sourceCategory: os
+  format: syslog
+  match:
+    contains: "sshd"
+  fields:
+    user:
+      from: user
+      type: string
+`
+	valPayload := map[string]string{
+		"yaml_content": validYAML,
+		"sample_log":   "<34>Sep 18 10:00:00 host sshd[1234]: Accepted publickey for ubuntu",
+	}
+	body, _ := json.Marshal(valPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/packs/validate", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var valResp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&valResp)
+	if valResp["valid"] != true || valResp["match"] != true {
+		t.Fatalf("expected validation success and match, got %+v", valResp)
+	}
+
+	// 3. Static SPA fallback
+	req = httptest.NewRequest(http.MethodGet, "/events/123", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("RAVEN Test UI")) {
+		t.Fatalf("expected index.html fallback for client routing, got: %s", rec.Body.String())
+	}
+}
+
+func TestAPI_QuarantineReplayAll(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	handler := srv.Handler()
+
+	// 1. Initially empty quarantine replay-all should succeed with total: 0
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/replay-all", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp["total"].(float64) != 0 || resp["replayed"].(float64) != 0 {
+		t.Fatalf("expected total 0 replayed 0, got %+v", resp)
+	}
+
+	// 2. Test GET /api/v1/packs/{name}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/packs/test-firewall", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for pack test-firewall, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("test-firewall")) {
+		t.Fatalf("expected YAML to contain test-firewall, got: %s", rec.Body.String())
+	}
+}
+
+func TestAPI_PathTraversalBlocked(t *testing.T) {
+	t.Setenv("RAVEN_ADMIN_TOKEN", "test-admin-token")
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	handler := srv.Handler()
+
+	// 1. Path traversal in GET /api/v1/packs/{name}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/packs/..%2f..%2fetc%2fpasswd", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for path traversal attempt, got %d", rec.Code)
+	}
+
+	// 2. Path traversal in POST /api/v1/packs/activate with malicious filename
+	maliciousPayload := map[string]string{
+		"yaml_content": `apiVersion: raven.io/v1
+kind: LogSource
+metadata:
+  name: malicious-pack
+  version: 1.0.0
+spec:
+  sourceCategory: network_device
+  format: syslog
+  match:
+    contains: "TEST"
+`,
+		"filename": "../../evil.yaml",
+	}
+	body, _ := json.Marshal(maliciousPayload)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-admin-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for malicious filename, got %d", rec.Code)
+	}
+}
+
+func TestAPI_ReplayIneligibleBlocked(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	ctx := context.Background()
+	// Create a raw record and quarantine it as ineligible (replay_eligible = false)
+	raw, err := store.Store(ctx, model.IngestedRecord{
+		Transport:  "syslog",
+		SourceIP:   "127.0.0.1",
+		RawBytes:   []byte("<14>1 unparseable"),
+		ReceivedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("store failed: %v", err)
+	}
+
+	err = store.Quarantine(ctx, model.QuarantineEntry{
+		QuarantineID:   "quar-ineligible-01",
+		RawID:          raw.RawID,
+		RawSHA256:      raw.RawSHA256,
+		Stage:          "decode",
+		Reason:         "corrupt_binary",
+		RawPreview:     "preview",
+		ReplayEligible: false, // Ineligible!
+		QuarantinedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("quarantine failed: %v", err)
+	}
+
+	handler := srv.Handler()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/quar-ineligible-01/replay", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when attempting to replay ineligible entry, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPI_StaticAndSPARouting(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+
+	handler := srv.Handler()
+
+	// 1. Root index.html
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "RAVEN Test UI") {
+		t.Fatalf("expected root to serve index.html, got: %s", rec.Body.String())
+	}
+
+	// 2. Static asset file
+	req = httptest.NewRequest(http.MethodGet, "/assets/test.js", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /assets/test.js, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "console.log('test')") {
+		t.Fatalf("expected static JS content, got: %s", rec.Body.String())
+	}
+
+	// 3. SPA client-side route fallback
+	req = httptest.NewRequest(http.MethodGet, "/events/raven-evt-001", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for SPA route, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "RAVEN Test UI") {
+		t.Fatalf("expected SPA fallback to index.html, got: %s", rec.Body.String())
+	}
+}
+
+func TestAPI_AdminTokenAuth_BA023(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "raven_auth_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "raven.db")
+	store, err := rawstore.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open raw store: %v", err)
+	}
+	defer store.Close()
+
+	cfg := api.ConfigInfo{
+		AdminToken: "super-secret-admin-token",
+	}
+	srv := api.NewServer("127.0.0.1:0", store, nil, nil, "", cfg, nil, "test-version")
+	handler := srv.Handler()
+
+	// 1. Without token on raw endpoint -> 401 Unauthorized
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized without token, got %d", rec.Code)
+	}
+
+	// 2. With wrong token -> 401 Unauthorized
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
+	req.Header.Set("X-RAVEN-Admin-Key", "wrong-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized with wrong token, got %d", rec.Code)
+	}
+
+	// 3. With correct token via header -> Allowed past auth (404 since record doesn't exist)
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
+	req.Header.Set("X-RAVEN-Admin-Key", "super-secret-admin-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found past auth, got %d", rec.Code)
+	}
+
+	// 4. With correct token via Bearer -> Allowed past auth
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
+	req.Header.Set("Authorization", "Bearer super-secret-admin-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found with Bearer token, got %d", rec.Code)
+	}
+
+	// Config must never publish the authorization secret.
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "super-secret-admin-token") || strings.Contains(rec.Body.String(), "admin_token") {
+		t.Fatalf("config response exposed an admin token: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Trace includes raw bytes and must use the same authorization boundary as /raw.
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/events/event/trace", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected trace request to require auth, got %d", rec.Code)
+	}
+
+	// Connectivity probes can reach network/filesystem targets, so require auth.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/connections/test", strings.NewReader(`{"yaml_content":""}`))
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected connection test to require auth, got %d", rec.Code)
+	}
+
+	// Shared management request limit rejects oversized JSON before decoding it.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/connections/test", strings.NewReader(`{"yaml_content":"`+strings.Repeat("x", (1<<20)+1)+`"}`))
+	req.Header.Set("Authorization", "Bearer super-secret-admin-token")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected oversized body to be rejected, got %d", rec.Code)
+	}
+}
+
+func TestMarketplaceCatalogAndProtectedRefresh(t *testing.T) {
+	srv, store, pipe, _ := setupTestServer(t)
+	defer store.Close()
+	pipe.Stop()
+	get := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/v1/marketplace/packs?q=network", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("marketplace search status = %d: %s", get.Code, get.Body.String())
+	}
+	var result struct {
+		Packs []map[string]any `json:"packs"`
+		Total int              `json:"total"`
+	}
+	if err := json.Unmarshal(get.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Total < len(result.Packs) {
+		t.Fatalf("marketplace returned %d packs but reported total %d", len(result.Packs), result.Total)
+	}
+	refresh := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(refresh, httptest.NewRequest(http.MethodPost, "/api/v1/marketplace/refresh", nil))
+	if refresh.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated refresh status = %d, want 403", refresh.Code)
+	}
+}
+
+func TestCORSAllowsOnlyExactLoopbackHosts(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+	for _, tc := range []struct {
+		origin string
+		allow  bool
+	}{
+		{"https://localhost:5173", true},
+		{"http://127.0.0.1:3000", true},
+		{"https://localhost.attacker.example", false},
+		{"http://127.0.0.1.attacker.example", false},
+		{"https://user@localhost", false},
+		{"https://localhost.evil:9090", false},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+		req.Header.Set("Origin", tc.origin)
+		res := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(res, req)
+		got := res.Header().Get("Access-Control-Allow-Origin") == tc.origin
+		if got != tc.allow {
+			t.Errorf("origin %q allowed=%v, want %v", tc.origin, got, tc.allow)
+		}
+	}
+}
+
+func TestApplyConnectionReusesManagedFilename(t *testing.T) {
+	srv, _, _, dir := setupTestServer(t)
+	manager := connections.NewManager(dir)
+	content, err := os.ReadFile(filepath.Join("..", "..", "sinks", "http-siem.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "http-siem.yaml"), content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.LoadDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetConnManager(manager, dir)
+	updated := strings.Replace(string(content), "version: 1.0.0", "version: 1.0.1", 1)
+	body, _ := json.Marshal(map[string]string{"yaml_content": updated})
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/connections/apply", bytes.NewReader(body)))
+	if res.Code != http.StatusOK {
+		t.Fatalf("apply status=%d body=%s", res.Code, res.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "siem-events.yaml")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected identity-based duplicate file, stat err=%v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "http-siem.yaml"))
+	if err != nil || !strings.Contains(string(got), "version: 1.0.1") {
+		t.Fatalf("managed file was not updated: err=%v", err)
+	}
+}
+
+func TestActivatePackRejectsMissingManager(t *testing.T) {
+	srv, store, pipe, _ := setupTestServer(t)
+	cfg := api.ConfigInfo{AdminToken: "test-token"}
+	missing := api.NewServer("127.0.0.1:0", store, pipe, nil, "", cfg, fstest.MapFS{"index.html": {Data: []byte("ui")}}, "test")
+	body := []byte(`{"yaml_content":"apiVersion: raven.io/v1\nkind: LogSource\nmetadata:\n  name: sample\n  version: 1.0.0\n  description: sample\n  author: test\nspec:\n  sourceCategory: application\n  format: json\n  match:\n    contains: sample\n  fields: {}\n"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	res := httptest.NewRecorder()
+	missing.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("activation without manager returned %d: %s", res.Code, res.Body.String())
+	}
+	_ = srv
+}
