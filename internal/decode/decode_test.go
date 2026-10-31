@@ -1,0 +1,785 @@
+package decode
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"raven/internal/model"
+	"testing"
+)
+
+func loadFixture(t *testing.T, relPath string) []byte {
+	t.Helper()
+	// Try relative to current package or relative to module root
+	paths := []string{
+		filepath.Join("../../", relPath),
+		relPath,
+	}
+	for _, p := range paths {
+		if data, err := os.ReadFile(p); err == nil {
+			return data
+		}
+	}
+	t.Fatalf("failed to find fixture %s", relPath)
+	return nil
+}
+
+func TestSyslogDecoder_RFC5424(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/syslog/valid_rfc5424.txt")
+	decoder := NewSyslogDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected RFC 5424 confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "syslog_rfc5424" {
+		t.Errorf("expected format syslog_rfc5424, got %s", rec.Format)
+	}
+	if rec.Headers["syslog_pri"] != 14 {
+		t.Errorf("expected PRI 14, got %v", rec.Headers["syslog_pri"])
+	}
+	if rec.Headers["syslog_facility"] != 1 {
+		t.Errorf("expected facility 1, got %v", rec.Headers["syslog_facility"])
+	}
+	if rec.Headers["syslog_severity"] != 6 {
+		t.Errorf("expected severity 6, got %v", rec.Headers["syslog_severity"])
+	}
+	if rec.Headers["syslog_host"] != "pa-fw-01" {
+		t.Errorf("expected host pa-fw-01, got %v", rec.Headers["syslog_host"])
+	}
+	if rec.Headers["syslog_app"] != "paloalto" {
+		t.Errorf("expected app paloalto, got %v", rec.Headers["syslog_app"])
+	}
+	if rec.Headers["syslog_msgid"] != "TRAFFIC" {
+		t.Errorf("expected msgid TRAFFIC, got %v", rec.Headers["syslog_msgid"])
+	}
+
+	// Verify extracted key-value fields
+	if rec.Fields["vendor_product"] != "PAN-OS" {
+		t.Errorf("expected vendor_product=PAN-OS, got %v", rec.Fields["vendor_product"])
+	}
+	if rec.Fields["action"] != "allow" {
+		t.Errorf("expected action=allow, got %v", rec.Fields["action"])
+	}
+	if rec.Fields["src"] != "10.0.1.50" {
+		t.Errorf("expected src=10.0.1.50, got %v", rec.Fields["src"])
+	}
+	if rec.Fields["dport"] != "443" {
+		t.Errorf("expected dport=443, got %v", rec.Fields["dport"])
+	}
+}
+
+func TestSyslogDecoder_RFC3164(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/syslog/valid_rfc3164.txt")
+	decoder := NewSyslogDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected RFC 3164 confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "syslog_rfc3164" {
+		t.Errorf("expected format syslog_rfc3164, got %s", rec.Format)
+	}
+	if rec.Headers["syslog_pri"] != 86 {
+		t.Errorf("expected PRI 86, got %v", rec.Headers["syslog_pri"])
+	}
+	if rec.Headers["syslog_facility"] != 10 {
+		t.Errorf("expected facility 10, got %v", rec.Headers["syslog_facility"])
+	}
+	if rec.Headers["syslog_severity"] != 6 {
+		t.Errorf("expected severity 6, got %v", rec.Headers["syslog_severity"])
+	}
+	if rec.Headers["syslog_host"] != "srv-prod-01" {
+		t.Errorf("expected host srv-prod-01, got %v", rec.Headers["syslog_host"])
+	}
+	if rec.Headers["syslog_app"] != "sshd" {
+		t.Errorf("expected app sshd, got %v", rec.Headers["syslog_app"])
+	}
+	if rec.Headers["syslog_pid"] != "14523" {
+		t.Errorf("expected pid 14523, got %v", rec.Headers["syslog_pid"])
+	}
+}
+
+func TestSyslogDecoder_RFC3164PaddedSingleDigitDay(t *testing.T) {
+	decoder := NewSyslogDecoder()
+	records, err := decoder.Decode([]byte("<166>Jun  1 10:00:00 asa-lab sshd[1234]: login failed"))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if got := records[0].Headers["syslog_host"]; got != "asa-lab" {
+		t.Fatalf("expected host asa-lab, got %v", got)
+	}
+	if got := records[0].Headers["syslog_time"]; got != "Jun 1 10:00:00" {
+		t.Fatalf("expected normalized syslog time, got %v", got)
+	}
+	if got := records[0].Fields["message"]; got != "login failed" {
+		t.Fatalf("expected message body, got %v", got)
+	}
+}
+
+func TestTextDecoderQuotedKeyValueFields(t *testing.T) {
+	decoder := NewTextDecoder()
+	records, err := decoder.Decode([]byte(`timestamp="2026-06-01T10:00:00Z" message="login failed for guest"`))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if got := records[0].Fields["timestamp"]; got != "2026-06-01T10:00:00Z" {
+		t.Fatalf("expected unquoted timestamp, got %v", got)
+	}
+	if got := records[0].Fields["message"]; got != "login failed for guest" {
+		t.Fatalf("expected quoted value with spaces, got %v", got)
+	}
+	if _, err := decoder.Decode([]byte(`event="unterminated`)); err == nil {
+		t.Fatal("expected an unterminated quoted key=value value to fail")
+	}
+}
+
+func TestSyslogDecoder_Malformed(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/syslog/malformed_truncated.txt")
+	decoder := NewSyslogDecoder()
+
+	_, err := decoder.Decode(fixture)
+	if err == nil {
+		t.Errorf("expected error decoding malformed syslog, got nil")
+	}
+}
+
+func TestJSONDecoder_Single(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/json/valid_single.json")
+	decoder := NewJSONDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Fields["service"] != "payment-gateway" {
+		t.Errorf("expected service payment-gateway, got %v", rec.Fields["service"])
+	}
+	if rec.Fields["amount"] != 15000.0 {
+		t.Errorf("expected amount 15000.0, got %v", rec.Fields["amount"])
+	}
+	if rec.Fields["error_code"] != "PG_TIMEOUT" {
+		t.Errorf("expected error_code PG_TIMEOUT, got %v", rec.Fields["error_code"])
+	}
+}
+
+func TestJSONDecoder_NDJSON(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/json/valid_ndjson.json")
+	decoder := NewJSONDecoder()
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records from NDJSON, got %d", len(records))
+	}
+
+	if records[0].RecordOrdinal != 0 || records[0].Fields["user"] != "alice" {
+		t.Errorf("unexpected record 0: %v", records[0])
+	}
+	if records[1].RecordOrdinal != 1 || records[1].Fields["user"] != "bob" {
+		t.Errorf("unexpected record 1: %v", records[1])
+	}
+}
+
+func TestJSONDecoder_Array(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/json/valid_array.json")
+	decoder := NewJSONDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.85 {
+		t.Errorf("expected confidence >= 0.85 for JSON array, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 2 {
+		t.Fatalf("expected 2 child records from JSON array, got %d", len(records))
+	}
+
+	if records[0].RecordOrdinal != 0 || records[0].Fields["host"] != "db-01" {
+		t.Errorf("unexpected array child 0: %v", records[0])
+	}
+	if records[1].RecordOrdinal != 1 || records[1].Fields["host"] != "db-02" {
+		t.Errorf("unexpected array child 1: %v", records[1])
+	}
+}
+
+func TestJSONDecoder_Malformed(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/json/malformed_unclosed.json")
+	decoder := NewJSONDecoder()
+
+	_, err := decoder.Decode(fixture)
+	if err == nil {
+		t.Errorf("expected error decoding unclosed JSON, got nil")
+	}
+}
+
+func TestCSVDecoder_Valid(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/csv/valid_headers.csv")
+	decoder := NewCSVDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.80 {
+		t.Errorf("expected confidence >= 0.80, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	// 1 header row + 3 data rows -> 3 child records
+	if len(records) != 3 {
+		t.Fatalf("expected 3 child records from CSV, got %d", len(records))
+	}
+
+	r0 := records[0]
+	if r0.RecordOrdinal != 0 {
+		t.Errorf("expected record ordinal 0, got %d", r0.RecordOrdinal)
+	}
+	if r0.Fields["source_ip"] != "10.0.1.50" {
+		t.Errorf("expected source_ip 10.0.1.50, got %v", r0.Fields["source_ip"])
+	}
+	if r0.Fields["port"] != "443" {
+		t.Errorf("expected port 443, got %v", r0.Fields["port"])
+	}
+	if r0.Fields["action"] != "allow" {
+		t.Errorf("expected action allow, got %v", r0.Fields["action"])
+	}
+
+	r2 := records[2]
+	if r2.RecordOrdinal != 2 {
+		t.Errorf("expected record ordinal 2, got %d", r2.RecordOrdinal)
+	}
+	if r2.Fields["action"] != "drop" {
+		t.Errorf("expected action drop, got %v", r2.Fields["action"])
+	}
+}
+
+func TestCSVDecoder_Malformed(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/csv/malformed_unquoted.csv")
+	decoder := NewCSVDecoder()
+
+	_, err := decoder.Decode(fixture)
+	if err == nil {
+		t.Errorf("expected error decoding malformed unquoted CSV, got nil")
+	}
+}
+
+func TestCSVDecoder_HeaderlessSingleRow(t *testing.T) {
+	decoder := NewCSVDecoder()
+	input := []byte("2026-06-01 10:00:00.000 UTC,user,db,1234,192.0.2.10:51000,session,1,SELECT\n")
+	records, err := decoder.Decode(input)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected headerless row as one record, got %d", len(records))
+	}
+	if records[0].Fields["column_0"] != "2026-06-01 10:00:00.000 UTC" || records[0].Fields["column_7"] != "SELECT" {
+		t.Fatalf("unexpected headerless columns: %v", records[0].Fields)
+	}
+}
+
+func TestCSVDecoder_DoesNotClaimCommaTextAsCSV(t *testing.T) {
+	text := []byte("1780308000: New client connected from 192.0.2.10:51000 as lab-sensor (p2, c1, k60).")
+	if got := NewCSVDecoder().Detect(text); got != 0 {
+		t.Fatalf("expected plain text not to be detected as CSV, got %f", got)
+	}
+}
+
+func TestTextDecoder_AcceptsUnclassifiedLogLines(t *testing.T) {
+	decoder := NewTextDecoder()
+	input := []byte("2026-06-01 10:00:00 server started successfully")
+	if got := decoder.Detect(input); got < 0.50 {
+		t.Fatalf("expected generic text detection above threshold, got %f", got)
+	}
+	records, err := decoder.Decode(input)
+	if err != nil || len(records) != 1 || records[0].Fields["message"] != string(input) {
+		t.Fatalf("expected one raw text message, records=%v err=%v", records, err)
+	}
+}
+
+func TestCEFDecoder_Valid(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/cef/valid_alert.txt")
+	decoder := NewCEFDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected CEF confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "cef" {
+		t.Errorf("expected format cef, got %s", rec.Format)
+	}
+	if rec.Headers["device_vendor"] != "Suricata" {
+		t.Errorf("expected vendor Suricata, got %v", rec.Headers["device_vendor"])
+	}
+	if rec.Headers["device_product"] != "IDPS" {
+		t.Errorf("expected product IDPS, got %v", rec.Headers["device_product"])
+	}
+	if rec.Headers["name"] != "ET SCAN Potential SSH Scan" {
+		t.Errorf("expected name ET SCAN Potential SSH Scan, got %v", rec.Headers["name"])
+	}
+	if rec.Headers["severity"] != "6" {
+		t.Errorf("expected severity 6, got %v", rec.Headers["severity"])
+	}
+
+	// Extension fields
+	if rec.Fields["src"] != "45.33.32.156" {
+		t.Errorf("expected src 45.33.32.156, got %v", rec.Fields["src"])
+	}
+	if rec.Fields["dst"] != "10.0.1.5" {
+		t.Errorf("expected dst 10.0.1.5, got %v", rec.Fields["dst"])
+	}
+	if rec.Fields["spt"] != "44100" {
+		t.Errorf("expected spt 44100, got %v", rec.Fields["spt"])
+	}
+	if rec.Fields["dpt"] != "22" {
+		t.Errorf("expected dpt 22, got %v", rec.Fields["dpt"])
+	}
+	if rec.Fields["act"] != "Alert" {
+		t.Errorf("expected act Alert, got %v", rec.Fields["act"])
+	}
+	if rec.Fields["msg"] != "Potential SSH brute force detected" {
+		t.Errorf("expected msg 'Potential SSH brute force detected', got %v", rec.Fields["msg"])
+	}
+}
+
+func TestCEFDecoder_Malformed(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/cef/malformed_header.txt")
+	decoder := NewCEFDecoder()
+
+	_, err := decoder.Decode(fixture)
+	if err == nil {
+		t.Errorf("expected error decoding malformed CEF header, got nil")
+	}
+}
+
+func TestTextDecoder_CombinedLog(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/text/valid_combined_log.txt")
+	decoder := NewTextDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.80 {
+		t.Errorf("expected confidence >= 0.80, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "text_clf" {
+		t.Errorf("expected format text_clf, got %s", rec.Format)
+	}
+	if rec.Fields["client_ip"] != "10.0.1.50" {
+		t.Errorf("expected client_ip 10.0.1.50, got %v", rec.Fields["client_ip"])
+	}
+	if rec.Fields["auth_user"] != "john" {
+		t.Errorf("expected auth_user john, got %v", rec.Fields["auth_user"])
+	}
+	if rec.Fields["http_method"] != "GET" {
+		t.Errorf("expected http_method GET, got %v", rec.Fields["http_method"])
+	}
+	if rec.Fields["url_path"] != "/dashboard" {
+		t.Errorf("expected url_path /dashboard, got %v", rec.Fields["url_path"])
+	}
+	if rec.Fields["status_code"] != 200 {
+		t.Errorf("expected status_code 200, got %v", rec.Fields["status_code"])
+	}
+	if rec.Fields["response_bytes"] != int64(15234) {
+		t.Errorf("expected response_bytes 15234, got %v", rec.Fields["response_bytes"])
+	}
+}
+
+func TestTextDecoder_Malformed(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/text/malformed_partial.txt")
+	decoder := NewTextDecoder()
+
+	_, err := decoder.Decode(fixture)
+	if err == nil {
+		t.Errorf("expected error decoding empty/malformed text, got nil")
+	}
+}
+
+func TestXMLDecoder_Single(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/xml/valid_single.xml")
+	decoder := NewXMLDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected XML confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "xml" {
+		t.Errorf("expected format xml, got %s", rec.Format)
+	}
+	if rec.Headers["xml_root_local"] != "event" {
+		t.Errorf("expected xml_root_local=event, got %v", rec.Headers["xml_root_local"])
+	}
+	if rec.Headers["@id"] != "evt-1001" {
+		t.Errorf("expected @id=evt-1001, got %v", rec.Headers["@id"])
+	}
+	if rec.Fields["source_ip"] != "192.168.1.100" {
+		t.Errorf("expected source_ip=192.168.1.100, got %v", rec.Fields["source_ip"])
+	}
+	if rec.Fields["action"] != "allow" {
+		t.Errorf("expected action=allow, got %v", rec.Fields["action"])
+	}
+
+	// Verify nested details map
+	details, ok := rec.Fields["details"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected details to be map[string]any, got %T", rec.Fields["details"])
+	}
+	if details["protocol"] != "TCP" {
+		t.Errorf("expected protocol=TCP, got %v", details["protocol"])
+	}
+}
+
+func TestXMLDecoder_Batch(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/xml/valid_batch.xml")
+	decoder := NewXMLDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected XML confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 2 {
+		t.Fatalf("expected 2 batch records, got %d", len(records))
+	}
+
+	if records[0].RecordOrdinal != 0 || records[1].RecordOrdinal != 1 {
+		t.Errorf("expected ordinals 0 and 1, got %d and %d", records[0].RecordOrdinal, records[1].RecordOrdinal)
+	}
+	if records[0].Fields["src"] != "10.1.1.1" || records[0].Fields["action"] != "block" {
+		t.Errorf("unexpected record 0 fields: %v", records[0].Fields)
+	}
+	if records[1].Fields["src"] != "10.1.1.2" || records[1].Fields["action"] != "allow" {
+		t.Errorf("unexpected record 1 fields: %v", records[1].Fields)
+	}
+}
+
+func TestXMLDecoder_MalformedAndSecurity(t *testing.T) {
+	decoder := NewXMLDecoder()
+
+	// Malformed unclosed XML
+	unclosed := loadFixture(t, "testdata/formats/xml/malformed_unclosed.xml")
+	_, err := decoder.Decode(unclosed)
+	if err == nil {
+		t.Errorf("expected error decoding unclosed XML, got nil")
+	}
+
+	// XXE rejection
+	xxe := loadFixture(t, "testdata/formats/xml/malformed_xxe.xml")
+	_, err = decoder.Decode(xxe)
+	if err == nil {
+		t.Errorf("expected error decoding XML with DOCTYPE/ENTITY directive, got nil")
+	}
+}
+
+func TestXMLDecoderRejectsSecondRoot(t *testing.T) {
+	if _, err := NewXMLDecoder().Decode([]byte(`<a/><b/>`)); err == nil {
+		t.Fatal("expected second top-level XML element to be rejected")
+	}
+}
+
+func TestSyslogRFC5424BracketsRemainInMessage(t *testing.T) {
+	input := []byte(`<14>1 2026-09-20T10:00:00Z host app 123 ID47 [meta x="y"] action=allow tags=[web]`)
+	records, err := NewSyslogDecoder().Decode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := records[0].Fields["message"]; got != "action=allow tags=[web]" {
+		t.Fatalf("message = %v", got)
+	}
+	if got := records[0].Headers["syslog_structured_data"]; got != `[meta x="y"]` {
+		t.Fatalf("structured data = %v", got)
+	}
+}
+
+func TestLEEFWindowsPathUnescapedOnce(t *testing.T) {
+	input := []byte(`LEEF:2.0|Vendor|Product|1.0|Evt|^|path=C:\\temp\\new^literal=\\t\\n`)
+	records, err := NewLEEFDecoder().Decode(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := records[0].Fields["path"]; got != `C:\temp\new` {
+		t.Fatalf("path = %q", got)
+	}
+	if got := records[0].Fields["literal"]; got != `\t\n` {
+		t.Fatalf("literal escapes = %q", got)
+	}
+}
+
+func TestLEEFDecoder_LEEF1(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/leef/valid_leef1.txt")
+	decoder := NewLEEFDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected LEEF confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Format != "leef" {
+		t.Errorf("expected format leef, got %s", rec.Format)
+	}
+	if rec.Headers["leef_version"] != "1.0" {
+		t.Errorf("expected leef_version=1.0, got %v", rec.Headers["leef_version"])
+	}
+	if rec.Headers["vendor"] != "Microsoft" {
+		t.Errorf("expected vendor=Microsoft, got %v", rec.Headers["vendor"])
+	}
+	if rec.Headers["product"] != "MSExchange" {
+		t.Errorf("expected product=MSExchange, got %v", rec.Headers["product"])
+	}
+	if rec.Headers["event_id"] != "4001" {
+		t.Errorf("expected event_id=4001, got %v", rec.Headers["event_id"])
+	}
+	if rec.Fields["src"] != "192.168.1.50" {
+		t.Errorf("expected src=192.168.1.50, got %v", rec.Fields["src"])
+	}
+	if rec.Fields["usrName"] != "alice" {
+		t.Errorf("expected usrName=alice, got %v", rec.Fields["usrName"])
+	}
+}
+
+func TestLEEFDecoder_LEEF2_CustomDelim(t *testing.T) {
+	fixture := loadFixture(t, "testdata/formats/leef/valid_leef2_custom_delim.txt")
+	decoder := NewLEEFDecoder()
+
+	conf := decoder.Detect(fixture)
+	if conf < 0.90 {
+		t.Errorf("expected LEEF confidence >= 0.90, got %f", conf)
+	}
+
+	records, err := decoder.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	if rec.Headers["leef_version"] != "2.0" {
+		t.Errorf("expected leef_version=2.0, got %v", rec.Headers["leef_version"])
+	}
+	if rec.Fields["src"] != "10.0.1.20" {
+		t.Errorf("expected src=10.0.1.20, got %v", rec.Fields["src"])
+	}
+	if rec.Fields["msg"] != "Packet dropped by policy" {
+		t.Errorf("expected msg='Packet dropped by policy', got %v", rec.Fields["msg"])
+	}
+}
+
+func TestLEEFDecoder_DuplicatesAndMalformed(t *testing.T) {
+	decoder := NewLEEFDecoder()
+
+	// Duplicate keys deterministic preservation
+	dup := []byte("LEEF:2.0|Vendor|Product|1.0|Evt|^|tag=alpha^tag=beta^tag=gamma")
+	recs, err := decoder.Decode(dup)
+	if err != nil {
+		t.Fatalf("Decode duplicate keys failed: %v", err)
+	}
+	tags, ok := recs[0].Fields["tag"].([]any)
+	if !ok || len(tags) != 3 {
+		t.Fatalf("expected 3 preserved duplicate values in slice, got %v", recs[0].Fields["tag"])
+	}
+	if tags[0] != "alpha" || tags[1] != "beta" || tags[2] != "gamma" {
+		t.Errorf("unexpected duplicates order: %v", tags)
+	}
+
+	// Malformed version
+	mal := loadFixture(t, "testdata/formats/leef/malformed_version.txt")
+	_, err = decoder.Decode(mal)
+	if err == nil {
+		t.Errorf("expected error for unsupported LEEF version, got nil")
+	}
+}
+
+func TestLayeredSyslog_LEEFAndCEF(t *testing.T) {
+	// Syslog RFC 5424 wrapping LEEF 2.0 with hex delimiter x5E (^)
+	fixture := loadFixture(t, "testdata/formats/leef/valid_leef_syslog.txt")
+	syslogDec := NewSyslogDecoder()
+
+	records, err := syslogDec.Decode(fixture)
+	if err != nil {
+		t.Fatalf("Decode layered syslog LEEF failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+
+	rec := records[0]
+	// Inner format detected
+	if rec.Format != "leef" {
+		t.Errorf("expected layered format leef, got %s", rec.Format)
+	}
+	// Outer envelope preserved in headers
+	if rec.Headers["syslog_envelope"] != "syslog_rfc5424" {
+		t.Errorf("expected syslog_envelope=syslog_rfc5424, got %v", rec.Headers["syslog_envelope"])
+	}
+	if rec.Headers["syslog_host"] != "iam-gateway" {
+		t.Errorf("expected syslog_host=iam-gateway, got %v", rec.Headers["syslog_host"])
+	}
+	// Inner fields decoded
+	if rec.Fields["usrName"] != "admin" {
+		t.Errorf("expected usrName=admin, got %v", rec.Fields["usrName"])
+	}
+	if rec.Fields["reason"] != "Bad credentials" {
+		t.Errorf("expected reason='Bad credentials', got %v", rec.Fields["reason"])
+	}
+	// Exact raw payload preserved
+	if string(rec.RawPayload) != string(fixture) {
+		t.Errorf("raw payload mismatch with original syslog envelope")
+	}
+}
+
+func TestRegistryAutoDetection(t *testing.T) {
+	registry := DefaultRegistry()
+
+	tests := []struct {
+		name         string
+		fixturePath  string
+		expectedName string
+		expectedRows int
+	}{
+		{"RFC5424", "testdata/formats/syslog/valid_rfc5424.txt", "syslog", 1},
+		{"RFC3164", "testdata/formats/syslog/valid_rfc3164.txt", "syslog", 1},
+		{"JSON Single", "testdata/formats/json/valid_single.json", "json", 1},
+		{"NDJSON", "testdata/formats/json/valid_ndjson.json", "json", 2},
+		{"JSON Array", "testdata/formats/json/valid_array.json", "json", 2},
+		{"CSV", "testdata/formats/csv/valid_headers.csv", "csv", 3},
+		{"CEF", "testdata/formats/cef/valid_alert.txt", "cef", 1},
+		{"XML Single", "testdata/formats/xml/valid_single.xml", "xml", 1},
+		{"XML Batch", "testdata/formats/xml/valid_batch.xml", "xml", 2},
+		{"LEEF 1.0", "testdata/formats/leef/valid_leef1.txt", "leef", 1},
+		{"LEEF 2.0", "testdata/formats/leef/valid_leef2_custom_delim.txt", "leef", 1},
+		{"Text CLF", "testdata/formats/text/valid_combined_log.txt", "text", 1},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := loadFixture(t, tc.fixturePath)
+			decoder, records, err := registry.DetectAndDecode(raw)
+			if err != nil {
+				t.Fatalf("DetectAndDecode failed for %s: %v", tc.name, err)
+			}
+			if decoder.Name() != tc.expectedName {
+				t.Errorf("expected decoder %s, got %s", tc.expectedName, decoder.Name())
+			}
+			if len(records) != tc.expectedRows {
+				t.Errorf("expected %d records, got %d", tc.expectedRows, len(records))
+			}
+		})
+	}
+}
+
+// MockAmbiguousDecoder is a mock decoder for testing tie-breaking behavior.
+type MockAmbiguousDecoder struct {
+	name  string
+	score float64
+}
+
+func (m *MockAmbiguousDecoder) Name() string              { return m.name }
+func (m *MockAmbiguousDecoder) Detect(raw []byte) float64 { return m.score }
+func (m *MockAmbiguousDecoder) Decode(raw []byte) ([]*model.DecodedRecord, error) {
+	return []*model.DecodedRecord{{Format: m.name}}, nil
+}
+
+func TestFormatAmbiguityDetection_BA011(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&MockAmbiguousDecoder{name: "custom_a", score: 0.95})
+	reg.Register(&MockAmbiguousDecoder{name: "custom_b", score: 0.95})
+
+	_, _, err := reg.DetectAndDecode([]byte("ambiguous raw content"))
+	if err == nil {
+		t.Fatalf("expected ErrAmbiguousFormat for tied top decoders, got nil")
+	}
+	if !errors.Is(err, ErrAmbiguousFormat) {
+		t.Errorf("expected ErrAmbiguousFormat error, got: %v", err)
+	}
+}
