@@ -52,7 +52,7 @@ jobs:
           { printf '%s\n' '---' '---' ''; cat README.md; } > marketplace-site/index.md
           cp MARKETPLACE.md CLI.md SECURITY.md BENCHMARKING.md marketplace-site/
           mkdir -p marketplace-site/assets marketplace-site/scripts
-          cp assets/raven-logo.png assets/raven-thumbnail-video.png marketplace-site/assets/
+          cp assets/raven-logo.svg marketplace-site/assets/
           cp scripts/build-release.sh scripts/build-release.ps1 marketplace-site/scripts/
       - name: Render README as the Pages homepage
         uses: actions/jekyll-build-pages@v1
