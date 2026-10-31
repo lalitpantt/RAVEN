@@ -5,18 +5,12 @@ import { RuntimeConfig } from '../types/config';
 import { ConnectionSummary, ConnectionValidationResponse, ConnectionTestResponse, ConnectionApplyResponse } from '../types/connection';
 
 const BASE_URL = '/api/v1';
-let adminToken = '';
-
-export function setAdminToken(token: string): void {
-  adminToken = token;
-}
 
 async function fetchJSON<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${endpoint}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...(adminToken ? { Authorization: `Bearer ${adminToken}` } : {}),
       ...options?.headers,
     },
   });
@@ -51,7 +45,6 @@ async function fetchText(endpoint: string, options?: RequestInit): Promise<strin
 }
 
 export const apiService = {
-  setAdminToken,
   integrityStatus: () => fetchJSON<{
     enabled: boolean; stream_id: string | null;
     local_head: { batch_id: number; entry_seq: number; hash: string | null };

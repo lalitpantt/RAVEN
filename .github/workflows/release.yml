@@ -31,6 +31,14 @@ jobs:
         run: |
           go vet ./...
           go test -count=1 ./...
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.6
+      - name: Build and test local anchor contract
+        working-directory: contracts
+        run: |
+          forge build
+          forge test
       - uses: actions/upload-artifact@v7
         with:
           name: web-dist
@@ -90,6 +98,13 @@ jobs:
           mkdir -p "$stage/packs"
           cp -R schemas sources sinks "$stage/"
           tar -czf "$stage.tar.gz" -C "$stage" .
+          contents="$(tar -tzf "$stage.tar.gz")"
+          binary_count="$(grep -Ec '(^|/)raven(\.exe)?$' <<<"$contents" || true)"
+          [[ "$binary_count" -eq 1 ]] || { echo "Expected exactly one RAVEN binary in archive" >&2; exit 1; }
+          if grep -Eq '(^|/)(raven-witness|contracts|anvil|forge|blockchain-dev|docker-compose\.blockchain\.yaml)(/|$)|\.sol$' <<<"$contents"; then
+            echo "Development blockchain components must not be included in release archives" >&2
+            exit 1
+          fi
       - name: Verify version flag on Linux amd64
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         shell: bash

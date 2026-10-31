@@ -30,7 +30,7 @@ func TestWitnessAuditForwardingUsesSeparateAdminCredential(t *testing.T) {
 	if err := store.EnableIntegrity(context.Background(), stream, epoch); err != nil {
 		t.Fatal(err)
 	}
-	s := NewServer("", store, nil, nil, "", ConfigInfo{AdminToken: "raven-admin"}, nil, "test")
+	s := NewServer("", store, nil, nil, "", ConfigInfo{}, nil, "test")
 	s.SetIntegrityWitness("http://witness.test", "witness-admin")
 	old := integrityWitnessHTTPClient
 	t.Cleanup(func() { integrityWitnessHTTPClient = old })
@@ -48,7 +48,6 @@ func TestWitnessAuditForwardingUsesSeparateAdminCredential(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusAccepted, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"run_id":"remote-1","state":"running","type":"ledger"}`)), Request: r}, nil
 	})}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrity/audits", strings.NewReader(`{"type":"ledger"}`))
-	req.Header.Set("Authorization", "Bearer raven-admin")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted || !strings.Contains(rec.Body.String(), `"run_id":"remote-1"`) {
@@ -67,7 +66,7 @@ func TestIntegrityStatusQueriesPrefixedWitnessStream(t *testing.T) {
 	if err := store.EnableIntegrity(context.Background(), stream, epoch); err != nil {
 		t.Fatal(err)
 	}
-	s := NewServer("", store, nil, nil, "", ConfigInfo{AdminToken: "raven-admin"}, nil, "test")
+	s := NewServer("", store, nil, nil, "", ConfigInfo{}, nil, "test")
 	s.SetIntegrityWitness("http://witness.test", "witness-admin")
 	old := integrityWitnessHTTPClient
 	t.Cleanup(func() { integrityWitnessHTTPClient = old })
@@ -80,7 +79,6 @@ func TestIntegrityStatusQueriesPrefixedWitnessStream(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 	})}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrity/status", nil)
-	req.Header.Set("Authorization", "Bearer raven-admin")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"chain_id":31337`) {

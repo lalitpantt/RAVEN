@@ -105,7 +105,6 @@ export const Config: React.FC = () => {
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
   const [connections, setConnections] = useState<ConnectionSummary[]>([]);
   const [selectedYaml, setSelectedYaml] = useState(SAMPLE_HTTP_YAML);
-  const [adminToken, setAdminToken] = useState('');
   const [activeTab, setActiveTab] = useState<'connections' | 'system'>('connections');
   const [actionStatus, setActionStatus] = useState<{ type: 'idle' | 'success' | 'error'; message: string }>({
     type: 'idle',
@@ -237,21 +236,6 @@ export const Config: React.FC = () => {
           </button>
         </div>
       </div>
-
-      <label className="block max-w-xl text-xs font-mono text-[#8b949e]">
-        Management API token <span className="text-[#6e7681]">(kept in this tab only)</span>
-        <input
-          type="password"
-          autoComplete="new-password"
-          value={adminToken}
-          onChange={(event) => {
-            setAdminToken(event.target.value);
-            apiService.setAdminToken(event.target.value);
-          }}
-          className="mt-1 w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-[#c9d1d9] outline-none focus:border-[#58a6ff]"
-          placeholder="Enter -admin-token / RAVEN_ADMIN_TOKEN"
-        />
-      </label>
 
       {activeTab === 'connections' ? (
         <div className="space-y-6">

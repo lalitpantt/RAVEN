@@ -66,14 +66,12 @@ func TestLocalMarketplaceUpgradeKeepsUnpinnedPackUnpinned(t *testing.T) {
 	}
 }
 
-func TestReplayRequestUsesAdminTokenAndRejectsBadResponses(t *testing.T) {
-	SetMarketplaceAdminToken("test-replay-token")
-	t.Cleanup(func() { SetMarketplaceAdminToken("") })
+func TestReplayRequestUnauthenticatedAndRejectsBadResponses(t *testing.T) {
 	req, err := newReplayRequest("http://localhost/replay")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := req.Header.Get("Authorization"); got != "Bearer test-replay-token" {
+	if got := req.Header.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization = %q", got)
 	}
 	for _, resp := range []*http.Response{

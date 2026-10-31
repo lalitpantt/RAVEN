@@ -14,6 +14,27 @@ import (
 	"raven/internal/marketplace"
 )
 
+func TestMetadataForReleaseRequiresCompleteEntries(t *testing.T) {
+	base := ownerMetadata{
+		Packs: map[string]packCoverage{"sample": {Product: "Sample product"}},
+		Releases: map[string]releaseMetadata{"sample@1.0.0": {
+			Changelog: "Initial release", RequiredDecoders: []string{"json"},
+		}},
+	}
+	if _, _, err := metadataForRelease(base, "sample", "1.0.0"); err != nil {
+		t.Fatalf("complete metadata rejected: %v", err)
+	}
+	delete(base.Packs, "sample")
+	if _, _, err := metadataForRelease(base, "sample", "1.0.0"); err == nil {
+		t.Fatal("missing pack coverage metadata accepted")
+	}
+	base.Packs["sample"] = packCoverage{Product: "Sample product"}
+	delete(base.Releases, "sample@1.0.0")
+	if _, _, err := metadataForRelease(base, "sample", "1.0.0"); err == nil {
+		t.Fatal("missing release metadata accepted")
+	}
+}
+
 func TestNextPatchVersion(t *testing.T) {
 	for input, want := range map[string]string{"1.0.0": "1.0.1", "v2.4.9": "v2.4.10"} {
 		got, err := nextPatchVersion(input)

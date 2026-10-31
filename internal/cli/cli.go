@@ -156,8 +156,7 @@ func daemonStartupBanner(pid int, command, uiAddr, logFile, packsDir string, mar
       %s stop                             # Stop the background daemon
 
   * Commands use the default management address; pass --ui and --packs-dir
-    where supported when this daemon uses non-default values. Marketplace changes
-    require RAVEN_ADMIN_TOKEN or --admin-token where that option is supported.
+    where supported when this daemon uses non-default values. Marketplace changes apply directly to this local RAVEN instance.
 
 `, pid, ui, packsDir, logFile, marketplace, marketplaceURL,
 		command, command, command, command, command, command, command, command, command, command, command, command)
@@ -353,7 +352,6 @@ func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
 		os.Exit(1)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	setMarketplaceAuth(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: RAVEN management API unavailable at %s; use --local only when the service is stopped: %v\n", baseURL, err)
@@ -370,7 +368,6 @@ func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
 	// 3. Reconcile quarantine DLQ: trigger bulk replay for matching quarantined logs
 	fmt.Printf("[RAVEN] Reconciling Quarantine DLQ against newly activated pack...\n")
 	replayReq, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/quarantine/replay-all", nil)
-	setMarketplaceAuth(replayReq)
 	replayResp, err := client.Do(replayReq)
 	if err == nil && replayResp.StatusCode == http.StatusOK {
 		var repResult struct {
@@ -554,7 +551,6 @@ func newReplayRequest(endpoint string) (*http.Request, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	setMarketplaceAuth(req)
 	return req, nil
 }
 
@@ -695,7 +691,6 @@ func RollbackPackCLI(uiAddr, packsDir string, local ...bool) {
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	req, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/packs/rollback", nil)
-	setMarketplaceAuth(req)
 	resp, err := client.Do(req)
 	if err == nil && resp.StatusCode == http.StatusOK {
 		var res struct {
@@ -815,9 +810,6 @@ func applyConnectionAPI(filePath, uiAddr string) (*connections.Connection, error
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if token := os.Getenv("RAVEN_ADMIN_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("live control plane unavailable: %w", err)
@@ -842,9 +834,6 @@ func rollbackConnectionAPI(uiAddr string) error {
 	req, err := http.NewRequest(http.MethodPost, GetBaseURL(uiAddr)+"/api/v1/connections/rollback", nil)
 	if err != nil {
 		return err
-	}
-	if token := os.Getenv("RAVEN_ADMIN_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {

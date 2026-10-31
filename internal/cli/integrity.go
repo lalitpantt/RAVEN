@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
 
 // RunIntegrityCLI executes the operator integrity commands. Exit codes are
 // 0 for accepted/passed, 1 for a verified mismatch, and 2 for unavailable work.
-func RunIntegrityCLI(args []string, defaultUI, adminToken string, stdout, stderr io.Writer) int {
+func RunIntegrityCLI(args []string, defaultUI string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "Usage: raven integrity status | verify --type fast|deep|ledger [--wait]")
 		return 2
@@ -23,15 +22,11 @@ func RunIntegrityCLI(args []string, defaultUI, adminToken string, stdout, stderr
 	fs := flag.NewFlagSet("integrity "+sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	ui := fs.String("ui", defaultUI, "Management API address")
-	token := fs.String("admin-token", adminToken, "RAVEN admin token (or RAVEN_ADMIN_TOKEN)")
 	typ := fs.String("type", "", "Audit type: fast, deep, or ledger")
 	wait := fs.Bool("wait", false, "Wait for the audit result")
 	timeout := fs.Duration("wait-timeout", 30*time.Second, "Maximum wait for audit completion")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
-	}
-	if *token == "" {
-		*token = strings.TrimSpace(os.Getenv("RAVEN_ADMIN_TOKEN"))
 	}
 	base := GetBaseURL(*ui)
 	request := func(method, path string, body io.Reader) (*http.Response, error) {
@@ -39,7 +34,6 @@ func RunIntegrityCLI(args []string, defaultUI, adminToken string, stdout, stderr
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+*token)
 		if body != nil {
 			req.Header.Set("Content-Type", "application/json")
 		}
@@ -48,7 +42,7 @@ func RunIntegrityCLI(args []string, defaultUI, adminToken string, stdout, stderr
 	switch sub {
 	case "status":
 		if fs.NArg() != 0 {
-			fmt.Fprintln(stderr, "Usage: raven integrity status [--ui address] [--admin-token token]")
+			fmt.Fprintln(stderr, "Usage: raven integrity status [--ui address]")
 			return 2
 		}
 		resp, err := request(http.MethodGet, "/api/v1/integrity/status", nil)

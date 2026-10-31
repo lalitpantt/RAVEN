@@ -14,19 +14,21 @@ import (
 func TestRunIntegrityCLIStatusAndWaitResult(t *testing.T) {
 	oldClient := integrityCLIHTTPClient
 	t.Cleanup(func() { integrityCLIHTTPClient = oldClient })
+	audits := 0
 	integrityCLIHTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Header.Get("Authorization") != "Bearer cli-secret" && r.Header.Get("Authorization") != "Bearer failed-secret" {
-			t.Errorf("missing CLI bearer credential")
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("unexpected admin authorization: %q", r.Header.Get("Authorization"))
 		}
 		body, status := `{"enabled":true}`, http.StatusOK
 		switch r.URL.Path {
 		case "/api/v1/integrity/audits":
+			audits++
 			var request map[string]string
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request["type"] != "fast" {
 				t.Errorf("audit request: %v %v", request, err)
 			}
 			body, status = `{"run_id":"run-1","state":"running","type":"fast"}`, http.StatusAccepted
-			if r.Header.Get("Authorization") == "Bearer failed-secret" {
+			if audits > 1 {
 				body = `{"run_id":"run-failed","state":"running","type":"fast"}`
 			}
 		case "/api/v1/integrity/audits/run-1":
@@ -37,17 +39,17 @@ func TestRunIntegrityCLIStatusAndWaitResult(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 	})}
 	var out, errOut bytes.Buffer
-	if code := RunIntegrityCLI([]string{"status"}, "http://operator.test", "cli-secret", &out, &errOut); code != 0 || !bytes.Contains(out.Bytes(), []byte(`"enabled": true`)) {
+	if code := RunIntegrityCLI([]string{"status"}, "http://operator.test", &out, &errOut); code != 0 || !bytes.Contains(out.Bytes(), []byte(`"enabled": true`)) {
 		t.Fatalf("status: code=%d out=%s err=%s", code, out.String(), errOut.String())
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := RunIntegrityCLI([]string{"verify", "--type", "fast", "--wait", "--wait-timeout", "1s"}, "http://operator.test", "cli-secret", &out, &errOut); code != 0 || !bytes.Contains(out.Bytes(), []byte("passed")) {
+	if code := RunIntegrityCLI([]string{"verify", "--type", "fast", "--wait", "--wait-timeout", "1s"}, "http://operator.test", &out, &errOut); code != 0 || !bytes.Contains(out.Bytes(), []byte("passed")) {
 		t.Fatalf("verify: code=%d out=%s err=%s", code, out.String(), errOut.String())
 	}
 	out.Reset()
 	errOut.Reset()
-	if code := RunIntegrityCLI([]string{"verify", "--type", "fast", "--wait"}, "http://operator.test", "failed-secret", &out, &errOut); code != 1 || !bytes.Contains(out.Bytes(), []byte("failed")) {
+	if code := RunIntegrityCLI([]string{"verify", "--type", "fast", "--wait"}, "http://operator.test", &out, &errOut); code != 1 || !bytes.Contains(out.Bytes(), []byte("failed")) {
 		t.Fatalf("failed audit exit code=%d out=%s err=%s", code, out.String(), errOut.String())
 	}
 }

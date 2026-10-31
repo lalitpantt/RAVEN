@@ -93,29 +93,22 @@ spec:
 	return srv, store, pipe, tempDir
 }
 
-func TestAPI_IntegrityOperatorAuthJobsAndPendingProof(t *testing.T) {
-	t.Setenv("RAVEN_ADMIN_TOKEN", "operator-secret")
+func TestAPI_IntegrityJobsAndPendingProofUnauthenticated(t *testing.T) {
 	srv, store, pipe, tempDir := setupTestServer(t)
 	defer os.RemoveAll(tempDir)
 	defer store.Close()
 	defer pipe.Stop()
 	handler := srv.Handler()
-	request := func(method, path, body, token string) *httptest.ResponseRecorder {
+	request := func(method, path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		return rec
 	}
-	if got := request(http.MethodGet, "/api/v1/integrity/status", "", ""); got.Code != http.StatusUnauthorized {
-		t.Fatalf("missing operator auth status=%d", got.Code)
-	}
-	if got := request(http.MethodGet, "/api/v1/integrity/status", "", "operator-secret"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"enabled":false`) {
+	if got := request(http.MethodGet, "/api/v1/integrity/status", ""); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"enabled":false`) {
 		t.Fatalf("disabled status: %d %s", got.Code, got.Body.String())
 	}
-	if got := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`, "operator-secret"); got.Code != http.StatusConflict {
+	if got := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`); got.Code != http.StatusConflict {
 		t.Fatalf("disabled audit status=%d body=%s", got.Code, got.Body.String())
 	}
 	var stream, epoch integrity.Hash
@@ -126,7 +119,7 @@ func TestAPI_IntegrityOperatorAuthJobsAndPendingProof(t *testing.T) {
 	if _, err := store.Store(context.Background(), model.IngestedRecord{Transport: "test", RawBytes: []byte("evidence"), ReceivedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	started := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`, "operator-secret")
+	started := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`)
 	if started.Code != http.StatusAccepted {
 		t.Fatalf("start audit: %d %s", started.Code, started.Body.String())
 	}
@@ -139,7 +132,7 @@ func TestAPI_IntegrityOperatorAuthJobsAndPendingProof(t *testing.T) {
 	}
 	var completed *httptest.ResponseRecorder
 	for i := 0; i < 100; i++ {
-		completed = request(http.MethodGet, "/api/v1/integrity/audits/"+accepted.RunID, "", "operator-secret")
+		completed = request(http.MethodGet, "/api/v1/integrity/audits/"+accepted.RunID, "")
 		if strings.Contains(completed.Body.String(), `"state":"completed"`) {
 			break
 		}
@@ -148,18 +141,18 @@ func TestAPI_IntegrityOperatorAuthJobsAndPendingProof(t *testing.T) {
 	if completed == nil || completed.Code != http.StatusOK || !strings.Contains(completed.Body.String(), `"result":"passed"`) {
 		t.Fatalf("audit did not pass: %v", completed)
 	}
-	proof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "", "operator-secret")
+	proof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "")
 	if proof.Code != http.StatusOK || !strings.Contains(proof.Body.String(), `"proof_state":"pending"`) || !strings.Contains(proof.Body.String(), `"reason":"entry batch is not sealed"`) {
 		t.Fatalf("pending proof response: %d %s", proof.Code, proof.Body.String())
 	}
 	if _, err := store.SealIntegrityBatch(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	sealedProof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "", "operator-secret")
+	sealedProof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "")
 	if sealedProof.Code != http.StatusOK || !strings.Contains(sealedProof.Body.String(), `"batch_id":1`) || !strings.Contains(sealedProof.Body.String(), `"leaf_index":0`) {
 		t.Fatalf("sealed inclusion proof: %d %s", sealedProof.Code, sealedProof.Body.String())
 	}
-	if bad := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"unbounded"}`, "operator-secret"); bad.Code != http.StatusBadRequest {
+	if bad := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"unbounded"}`); bad.Code != http.StatusBadRequest {
 		t.Fatalf("invalid audit type status=%d", bad.Code)
 	}
 }
@@ -530,7 +523,6 @@ func TestAPI_ConcurrentReplayWithSameKeyResolvesOnce(t *testing.T) {
 }
 
 func TestAPI_PathTraversalBlocked(t *testing.T) {
-	t.Setenv("RAVEN_ADMIN_TOKEN", "test-admin-token")
 	srv, store, pipe, tempDir := setupTestServer(t)
 	defer os.RemoveAll(tempDir)
 	defer store.Close()
@@ -563,7 +555,6 @@ spec:
 	}
 	body, _ := json.Marshal(maliciousPayload)
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer test-admin-token")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -655,96 +646,37 @@ func TestAPI_StaticAndSPARouting(t *testing.T) {
 	}
 }
 
-func TestAPI_AdminTokenAuth_BA023(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "raven_auth_test_*")
+func TestManagementRoutesUnauthenticated(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "raven_management_test_*")
 	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempDir)
-
-	dbPath := filepath.Join(tempDir, "raven.db")
-	store, err := rawstore.New(dbPath)
+	store, err := rawstore.New(filepath.Join(tempDir, "raven.db"))
 	if err != nil {
-		t.Fatalf("failed to open raw store: %v", err)
+		t.Fatal(err)
 	}
 	defer store.Close()
-
-	cfg := api.ConfigInfo{
-		AdminToken: "super-secret-admin-token",
-	}
-	srv := api.NewServer("127.0.0.1:0", store, nil, nil, "", cfg, nil, "test-version")
+	srv := api.NewServer("127.0.0.1:0", store, nil, nil, "", api.ConfigInfo{}, nil, "test-version")
 	handler := srv.Handler()
+	for _, path := range []string{"/api/v1/raw/raven-raw-nonexistent", "/api/v1/events/event/trace", "/api/v1/integrity/status"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+			t.Errorf("%s unexpectedly requires admin auth: %d", path, rec.Code)
+		}
+	}
 
-	// 1. Without token on raw endpoint -> 401 Unauthorized
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
+	// Management request limits still reject oversized input without auth.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/test", strings.NewReader(`{"yaml_content":"`+strings.Repeat("x", (1<<20)+1)+`"}`))
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized without token, got %d", rec.Code)
-	}
-
-	// 2. With wrong token -> 401 Unauthorized
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
-	req.Header.Set("X-RAVEN-Admin-Key", "wrong-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized with wrong token, got %d", rec.Code)
-	}
-
-	// 3. With correct token via header -> Allowed past auth (404 since record doesn't exist)
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
-	req.Header.Set("X-RAVEN-Admin-Key", "super-secret-admin-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 Not Found past auth, got %d", rec.Code)
-	}
-
-	// 4. With correct token via Bearer -> Allowed past auth
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/raw/raven-raw-nonexistent", nil)
-	req.Header.Set("Authorization", "Bearer super-secret-admin-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 Not Found with Bearer token, got %d", rec.Code)
-	}
-
-	// Config must never publish the authorization secret.
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "super-secret-admin-token") || strings.Contains(rec.Body.String(), "admin_token") {
-		t.Fatalf("config response exposed an admin token: status=%d body=%s", rec.Code, rec.Body.String())
-	}
-
-	// Trace includes raw bytes and must use the same authorization boundary as /raw.
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/events/event/trace", nil)
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected trace request to require auth, got %d", rec.Code)
-	}
-
-	// Connectivity probes can reach network/filesystem targets, so require auth.
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/connections/test", strings.NewReader(`{"yaml_content":""}`))
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected connection test to require auth, got %d", rec.Code)
-	}
-
-	// Shared management request limit rejects oversized JSON before decoding it.
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/connections/test", strings.NewReader(`{"yaml_content":"`+strings.Repeat("x", (1<<20)+1)+`"}`))
-	req.Header.Set("Authorization", "Bearer super-secret-admin-token")
-	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected oversized body to be rejected, got %d", rec.Code)
 	}
 }
 
-func TestMarketplaceCatalogAndProtectedRefresh(t *testing.T) {
+func TestMarketplaceCatalogAndRefreshUnauthenticated(t *testing.T) {
 	srv, store, pipe, _ := setupTestServer(t)
 	defer store.Close()
 	pipe.Stop()
@@ -765,8 +697,8 @@ func TestMarketplaceCatalogAndProtectedRefresh(t *testing.T) {
 	}
 	refresh := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(refresh, httptest.NewRequest(http.MethodPost, "/api/v1/marketplace/refresh", nil))
-	if refresh.Code != http.StatusForbidden {
-		t.Fatalf("unauthenticated refresh status = %d, want 403", refresh.Code)
+	if refresh.Code != http.StatusBadGateway {
+		t.Fatalf("unauthenticated refresh should reach the offline marketplace handler: %d %s", refresh.Code, refresh.Body.String())
 	}
 }
 
@@ -826,11 +758,10 @@ func TestApplyConnectionReusesManagedFilename(t *testing.T) {
 
 func TestActivatePackRejectsMissingManager(t *testing.T) {
 	srv, store, pipe, _ := setupTestServer(t)
-	cfg := api.ConfigInfo{AdminToken: "test-token"}
+	cfg := api.ConfigInfo{}
 	missing := api.NewServer("127.0.0.1:0", store, pipe, nil, "", cfg, fstest.MapFS{"index.html": {Data: []byte("ui")}}, "test")
 	body := []byte(`{"yaml_content":"apiVersion: raven.io/v1\nkind: LogSource\nmetadata:\n  name: sample\n  version: 1.0.0\n  description: sample\n  author: test\nspec:\n  sourceCategory: application\n  format: json\n  match:\n    contains: sample\n  fields: {}\n"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer test-token")
 	res := httptest.NewRecorder()
 	missing.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusServiceUnavailable {

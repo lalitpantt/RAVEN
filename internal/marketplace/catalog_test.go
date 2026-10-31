@@ -54,13 +54,13 @@ func TestOwnerSigningKeysAreTrusted(t *testing.T) {
 	}
 }
 
-func TestSeedCatalogIsEmptyAndSigned(t *testing.T) {
+func TestSeedCatalogIsPopulatedAndSigned(t *testing.T) {
 	catalog, err := LoadCatalog()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(SeedCatalogBytes()) == 0 || len(catalog.Packs) != 0 {
-		t.Fatalf("expected a signed empty seed catalog, got %d packs", len(catalog.Packs))
+	if len(SeedCatalogBytes()) == 0 || len(catalog.Packs) == 0 {
+		t.Fatalf("expected a signed populated seed catalog, got %d packs", len(catalog.Packs))
 	}
 }
 

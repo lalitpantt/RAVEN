@@ -146,12 +146,14 @@ func (s *RawStore) SyncWitnessOnce(ctx context.Context, client *http.Client, end
 				_ = s.recordWitnessSyncError(ctx, streamBytes, batchID, err)
 				return err
 			}
-			var previousWire witnessAckJSON
-			if err = json.Unmarshal(previous, &previousWire); err != nil {
-				return err
+			previousWire, decodeErr := decodeStoredWitnessAck(previous)
+			if decodeErr != nil {
+				_ = s.recordWitnessSyncError(ctx, streamBytes, batchID, decodeErr)
+				return decodeErr
 			}
 			previousSigned, decodeErr := decodeWitnessAck(previousWire)
 			if decodeErr != nil {
+				_ = s.recordWitnessSyncError(ctx, streamBytes, batchID, decodeErr)
 				return decodeErr
 			}
 			expectedPrevious, err = integrity.AcknowledgementHash(previousSigned)
@@ -245,12 +247,14 @@ func (s *RawStore) refreshWitnessBatch(ctx context.Context, client *http.Client,
 		if err = s.db.QueryRowContext(ctx, `SELECT acknowledgement FROM integrity_witness_sync WHERE stream_id=? AND batch_id=?`, streamBytes, batchID-1).Scan(&previous); err != nil {
 			return fmt.Errorf("prior witness acknowledgement is missing: %w", err)
 		}
-		var previousWire witnessAckJSON
-		if err = json.Unmarshal(previous, &previousWire); err != nil {
-			return err
+		previousWire, decodeErr := decodeStoredWitnessAck(previous)
+		if decodeErr != nil {
+			_ = s.recordWitnessRefreshError(ctx, streamBytes, batchID, decodeErr)
+			return decodeErr
 		}
 		previousSigned, decodeErr := decodeWitnessAck(previousWire)
 		if decodeErr != nil {
+			_ = s.recordWitnessRefreshError(ctx, streamBytes, batchID, decodeErr)
 			return decodeErr
 		}
 		previousHash, err = integrity.AcknowledgementHash(previousSigned)
@@ -274,7 +278,11 @@ func (s *RawStore) refreshWitnessBatch(ctx context.Context, client *http.Client,
 	if state != "anchored" {
 		next = time.Now().UTC().Add(5 * time.Second).Format(time.RFC3339Nano)
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE integrity_witness_sync SET state=?,acknowledgement=?,last_error=NULL,next_retry_at=? WHERE stream_id=? AND batch_id=?`, state, body, next, streamBytes, batchID)
+	ackBody, err := json.Marshal(wire)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE integrity_witness_sync SET state=?,acknowledgement=?,last_error=NULL,next_retry_at=? WHERE stream_id=? AND batch_id=?`, state, ackBody, next, streamBytes, batchID)
 	return err
 }
 
@@ -365,6 +373,26 @@ func decodeWitnessAck(w witnessAckJSON) (integrity.SignedAcknowledgement, error)
 	result.Acknowledgement = integrity.WitnessAcknowledgement{StreamID: stream, BatchID: w.BatchID, BatchHash: batch, PreviousAckHash: previous, WitnessKeyID: w.KeyID, ReceivedAtNS: received.UnixNano()}
 	result.Signature = signature
 	return result, nil
+}
+
+func decodeStoredWitnessAck(data []byte) (witnessAckJSON, error) {
+	var wire witnessAckJSON
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return wire, err
+	}
+	if wire.StreamID != "" {
+		return wire, nil
+	}
+	var retained struct {
+		Acknowledgement witnessAckJSON `json:"acknowledgement"`
+	}
+	if err := json.Unmarshal(data, &retained); err != nil {
+		return wire, err
+	}
+	if retained.Acknowledgement.StreamID == "" {
+		return wire, errors.New("stored witness acknowledgement has no stream ID")
+	}
+	return retained.Acknowledgement, nil
 }
 
 func decodeHash(value string) (integrity.Hash, error) {

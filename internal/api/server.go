@@ -51,7 +51,6 @@ type ConfigInfo struct {
 	Workers           int    `json:"workers"`
 	AirGapped         bool   `json:"air_gapped"`
 	MarketplaceOnline bool   `json:"marketplace_online"`
-	AdminToken        string `json:"-"`
 }
 
 // IngestTracker provides adapter operational status for health checks.
@@ -152,51 +151,6 @@ func (s *Server) SetConnManager(mgr *connections.Manager, dir string) {
 	s.connsDir = dir
 }
 
-func (s *Server) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token := s.cfgInfo.AdminToken
-		if token == "" {
-			token = os.Getenv("RAVEN_ADMIN_TOKEN")
-		}
-		if token != "" {
-			provided := r.Header.Get("X-RAVEN-Admin-Key")
-			if provided == "" {
-				authHeader := r.Header.Get("Authorization")
-				if strings.HasPrefix(authHeader, "Bearer ") {
-					provided = strings.TrimPrefix(authHeader, "Bearer ")
-				}
-			}
-			if provided != token {
-				s.jsonError(w, http.StatusUnauthorized, "unauthorized: invalid or missing admin token")
-				return
-			}
-		}
-		next(w, r)
-	}
-}
-
-func (s *Server) requireConfiguredAdminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token := s.cfgInfo.AdminToken
-		if token == "" {
-			token = os.Getenv("RAVEN_ADMIN_TOKEN")
-		}
-		if token == "" {
-			s.jsonError(w, http.StatusForbidden, "admin management requires RAVEN_ADMIN_TOKEN or --admin-token")
-			return
-		}
-		provided := r.Header.Get("X-RAVEN-Admin-Key")
-		if provided == "" && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
-			provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		}
-		if provided != token {
-			s.jsonError(w, http.StatusUnauthorized, "unauthorized: invalid or missing admin token")
-			return
-		}
-		next(w, r)
-	}
-}
-
 // Handler returns the http.Handler for all API and static routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -206,38 +160,38 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
 	mux.HandleFunc("GET /api/v1/events", s.handleListEvents)
 	mux.HandleFunc("GET /api/v1/events/{id}", s.handleGetEvent)
-	mux.HandleFunc("GET /api/v1/events/{id}/trace", s.requireAdminAuth(s.handleEventTrace))
+	mux.HandleFunc("GET /api/v1/events/{id}/trace", s.handleEventTrace)
 	mux.HandleFunc("POST /api/v1/events/{id}/verify", s.handleVerifyEvent)
-	mux.HandleFunc("GET /api/v1/raw/{id}", s.requireAdminAuth(s.handleGetRaw))
-	mux.HandleFunc("POST /api/v1/raw/{id}/verify", s.requireAdminAuth(s.handleVerifyRaw))
+	mux.HandleFunc("GET /api/v1/raw/{id}", s.handleGetRaw)
+	mux.HandleFunc("POST /api/v1/raw/{id}/verify", s.handleVerifyRaw)
 	mux.HandleFunc("GET /api/v1/quarantine", s.handleListQuarantine)
-	mux.HandleFunc("POST /api/v1/quarantine/replay-all", s.requireAdminAuth(s.handleReplayAllQuarantine))
-	mux.HandleFunc("POST /api/v1/quarantine/{id}/replay", s.requireAdminAuth(s.handleReplayQuarantine))
+	mux.HandleFunc("POST /api/v1/quarantine/replay-all", s.handleReplayAllQuarantine)
+	mux.HandleFunc("POST /api/v1/quarantine/{id}/replay", s.handleReplayQuarantine)
 	mux.HandleFunc("GET /api/v1/sources", s.handleListSources)
 	mux.HandleFunc("GET /api/v1/packs", s.handleListPacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs", s.handleMarketplacePacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs/{name}", s.handleMarketplacePack)
 	mux.HandleFunc("GET /api/v1/marketplace/status", s.handleMarketplaceStatus)
-	mux.HandleFunc("POST /api/v1/marketplace/refresh", s.requireConfiguredAdminAuth(s.handleMarketplaceRefresh))
-	mux.HandleFunc("POST /api/v1/marketplace/fetch", s.requireConfiguredAdminAuth(s.handleMarketplaceFetch))
+	mux.HandleFunc("POST /api/v1/marketplace/refresh", s.handleMarketplaceRefresh)
+	mux.HandleFunc("POST /api/v1/marketplace/fetch", s.handleMarketplaceFetch)
 	mux.HandleFunc("GET /api/v1/packs/{name}", s.handleGetPack)
 	mux.HandleFunc("POST /api/v1/packs/validate", s.handleValidatePack)
-	mux.HandleFunc("POST /api/v1/packs/activate", s.requireConfiguredAdminAuth(s.handleActivatePack))
-	mux.HandleFunc("POST /api/v1/packs/install", s.requireConfiguredAdminAuth(s.handleMarketplaceInstall))
-	mux.HandleFunc("POST /api/v1/packs/upgrade", s.requireConfiguredAdminAuth(s.handleMarketplaceUpgrade))
-	mux.HandleFunc("DELETE /api/v1/packs/{name}", s.requireConfiguredAdminAuth(s.handleMarketplaceRemove))
-	mux.HandleFunc("POST /api/v1/packs/rollback", s.requireConfiguredAdminAuth(s.handleRollbackPack))
+	mux.HandleFunc("POST /api/v1/packs/activate", s.handleActivatePack)
+	mux.HandleFunc("POST /api/v1/packs/install", s.handleMarketplaceInstall)
+	mux.HandleFunc("POST /api/v1/packs/upgrade", s.handleMarketplaceUpgrade)
+	mux.HandleFunc("DELETE /api/v1/packs/{name}", s.handleMarketplaceRemove)
+	mux.HandleFunc("POST /api/v1/packs/rollback", s.handleRollbackPack)
 	mux.HandleFunc("GET /api/v1/connections", s.handleListConnections)
 	mux.HandleFunc("GET /api/v1/connections/{name}", s.handleGetConnection)
 	mux.HandleFunc("POST /api/v1/connections/validate", s.handleValidateConnection)
-	mux.HandleFunc("POST /api/v1/connections/test", s.requireAdminAuth(s.handleTestConnection))
-	mux.HandleFunc("POST /api/v1/connections/apply", s.requireAdminAuth(s.handleApplyConnection))
-	mux.HandleFunc("POST /api/v1/connections/rollback", s.requireAdminAuth(s.handleRollbackConnection))
+	mux.HandleFunc("POST /api/v1/connections/test", s.handleTestConnection)
+	mux.HandleFunc("POST /api/v1/connections/apply", s.handleApplyConnection)
+	mux.HandleFunc("POST /api/v1/connections/rollback", s.handleRollbackConnection)
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
-	mux.HandleFunc("GET /api/v1/integrity/status", s.requireConfiguredAdminAuth(s.handleIntegrityStatus))
-	mux.HandleFunc("POST /api/v1/integrity/audits", s.requireConfiguredAdminAuth(s.handleStartIntegrityAudit))
-	mux.HandleFunc("GET /api/v1/integrity/audits/{run_id}", s.requireConfiguredAdminAuth(s.handleGetIntegrityAudit))
-	mux.HandleFunc("GET /api/v1/integrity/proofs/{entry_seq}", s.requireConfiguredAdminAuth(s.handleIntegrityProof))
+	mux.HandleFunc("GET /api/v1/integrity/status", s.handleIntegrityStatus)
+	mux.HandleFunc("POST /api/v1/integrity/audits", s.handleStartIntegrityAudit)
+	mux.HandleFunc("GET /api/v1/integrity/audits/{run_id}", s.handleGetIntegrityAudit)
+	mux.HandleFunc("GET /api/v1/integrity/proofs/{entry_seq}", s.handleIntegrityProof)
 
 	// Static UI routing with SPA client-side fallback
 	mux.HandleFunc("/", s.handleStaticOrSPA)
@@ -1639,7 +1593,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 			}
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-RAVEN-Key")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-RAVEN-Key")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

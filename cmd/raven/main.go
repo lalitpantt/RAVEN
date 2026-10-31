@@ -131,9 +131,6 @@ func main() {
 					if a == "--ui" {
 						uiAddr = os.Args[i+1]
 					}
-					if a == "--admin-token" {
-						cli.SetMarketplaceAdminToken(os.Args[i+1])
-					}
 				}
 			}
 			os.Args = append([]string{os.Args[0], os.Args[1]}, stripCommandOptions(os.Args[2:], false)...)
@@ -199,9 +196,6 @@ func main() {
 			for i, a := range os.Args {
 				if (a == "-packs-dir" || a == "--packs-dir") && i+1 < len(os.Args) {
 					pDir = os.Args[i+1]
-				}
-				if a == "--admin-token" && i+1 < len(os.Args) {
-					cli.SetMarketplaceAdminToken(os.Args[i+1])
 				}
 				if a == "--ui" && i+1 < len(os.Args) {
 					uiAddr = os.Args[i+1]
@@ -345,7 +339,7 @@ func main() {
 			cli.ListPacksCLI(":9090", pDir)
 			return
 		case "integrity":
-			code := cli.RunIntegrityCLI(os.Args[2:], ":9090", os.Getenv("RAVEN_ADMIN_TOKEN"), os.Stdout, os.Stderr)
+			code := cli.RunIntegrityCLI(os.Args[2:], ":9090", os.Stdout, os.Stderr)
 			if code != 0 {
 				os.Exit(code)
 			}
@@ -404,8 +398,7 @@ func main() {
 	stdoutOutput := flag.Bool("stdout", true, "Emit normalized NDJSON events to stdout")
 
 	// Management UI and Control Plane flag
-	uiAddr := flag.String("ui", "127.0.0.1:9090", "Address for Management Web UI and Control Plane API (loopback by default; use TLS termination before public exposure, 'none' to disable)")
-	adminToken := flag.String("admin-token", "", "Optional secret token for authenticating control-plane mutation API routes")
+	uiAddr := flag.String("ui", "127.0.0.1:9090", "Address for the unauthenticated Management Web UI and API (keep on loopback or a trusted private network; 'none' to disable)")
 	marketplaceOnline := flag.Bool("marketplace-online", false, "Allow explicit parser marketplace network requests")
 	marketplaceURL := flag.String("marketplace-url", "https://ashokkmt.github.io/raven", "Static parser marketplace registry URL")
 
@@ -682,7 +675,6 @@ func main() {
 			InboxDir:   *inboxDir,
 			DBPath:     *dbPath,
 			Workers:    *workers,
-			AdminToken: *adminToken,
 		}
 		uiServer = api.NewServer(*uiAddr, store, p, packManager, *packsDir, cfgInfo, web.Dist(), Version)
 		uiServer.SetIntegrityWitness(os.Getenv("RAVEN_WITNESS_URL"), os.Getenv("RAVEN_WITNESS_ADMIN_TOKEN"))
@@ -838,7 +830,7 @@ func stripCommandOptions(args []string, stripJSON bool) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--packs-dir", "-packs-dir", "--ui", "--admin-token", "--marketplace-url":
+		case "--packs-dir", "-packs-dir", "--ui", "--marketplace-url":
 			i++
 		case "--local", "--marketplace-online":
 		case "--json":

@@ -1426,6 +1426,31 @@
         "web",
         "access"
       ]
+    },
+    "syrotech-gpon-1100-wdont": {
+      "vendor": "SyroTech",
+      "product": "SY-GPON-1100-WDONT",
+      "models": [
+        "SY-GPON-1100-WDONT"
+      ],
+      "tags": [
+        "gpon",
+        "onu",
+        "syslog"
+      ]
+    },
+    "tplink-archer-c20-syslog": {
+      "vendor": "TP-Link",
+      "product": "Archer C20",
+      "models": [
+        "Archer C20"
+      ],
+      "tags": [
+        "router",
+        "dhcp",
+        "system",
+        "syslog"
+      ]
     }
   },
   "releases": {
@@ -2605,6 +2630,24 @@
       "min_raven": "",
       "required_decoders": [
         "text"
+      ],
+      "published_at": ""
+    },
+    "syrotech-gpon-1100-wdont@0.1.0": {
+      "changelog": "Initial marketplace release for SyroTech SY-GPON-1100-WDONT kernel syslog messages.",
+      "withdrawn": false,
+      "min_raven": "",
+      "required_decoders": [
+        "syslog"
+      ],
+      "published_at": ""
+    },
+    "tplink-archer-c20-syslog@0.1.1": {
+      "changelog": "Initial marketplace release for TP-Link Archer C20 DHCP and system syslog messages.",
+      "withdrawn": false,
+      "min_raven": "",
+      "required_decoders": [
+        "syslog"
       ],
       "published_at": ""
     }

@@ -14,7 +14,6 @@ init() {
 RAVEN_STREAM_ID=$stream
 RAVEN_INSTALLATION_EPOCH=$epoch
 RAVEN_GENESIS_HASH=$genesis
-RAVEN_ADMIN_TOKEN=$(openssl rand -hex 32)
 RAVEN_WITNESS_TOKEN=$(openssl rand -hex 32)
 RAVEN_WITNESS_ADMIN_TOKEN=$(openssl rand -hex 32)
 RAVEN_ANCHOR_PRIVATE_KEY=ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -98,19 +97,19 @@ native_up() {
   (cd "$ROOT/web" && npm ci && npm run build)
   (cd "$ROOT" && go build -o "$LAB/bin/raven" ./cmd/raven && go build -o "$LAB/bin/raven-witness" ./cmd/raven-witness && go build -o "$LAB/bin/logsim" ./cmd/logsim)
   if [[ ! -f "$LAB/witness.pid" ]] || ! kill -0 "$(cat "$LAB/witness.pid")" 2>/dev/null; then
-    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; "$LAB/bin/raven-witness" -config "$LAB/witness/witness-native.yaml" > "$LAB/witness/witness.log" 2>&1) & echo $! > "$LAB/witness.pid"
+    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; exec "$LAB/bin/raven-witness" -config "$LAB/witness/witness-native.yaml") > "$LAB/witness/witness.log" 2>&1 & echo $! > "$LAB/witness.pid"
   fi
   if [[ ! -f "$LAB/raven.pid" ]] || ! kill -0 "$(cat "$LAB/raven.pid")" 2>/dev/null; then
     mkdir -p "$LAB/raven/inbox" "$LAB/raven/output"
-    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; export RAVEN_WITNESS_URL=http://127.0.0.1:19091 RAVEN_WITNESS_PUBLIC_KEY="$LAB/witness/receipt-key.pub"; "$LAB/bin/raven" -db "$LAB/raven/raven.db" -inbox "$LAB/raven/inbox" -output-file "$LAB/raven/output/normalized.ndjson" -syslog-udp none -syslog-tcp none -http 127.0.0.1:18080 -ui 127.0.0.1:19090) > "$LAB/raven/raven.log" 2>&1 & echo $! > "$LAB/raven.pid"
+    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; export RAVEN_WITNESS_URL=http://127.0.0.1:19091 RAVEN_WITNESS_PUBLIC_KEY="$LAB/witness/receipt-key.pub"; exec "$LAB/bin/raven" -db "$LAB/raven/raven.db" -inbox "$LAB/raven/inbox" -output-file "$LAB/raven/output/normalized.ndjson" -syslog-udp none -syslog-tcp none -http 127.0.0.1:18080 -ui 127.0.0.1:19090) > "$LAB/raven/raven.log" 2>&1 & echo $! > "$LAB/raven.pid"
   fi
   for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1 && break; sleep 1; done
   curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null || fail "RAVEN failed; inspect $LAB/raven/raven.log"
   set -a; source "$LAB/lab.env"; set +a
   for _ in $(seq 1 60); do curl -fsS -H "Authorization: Bearer $RAVEN_WITNESS_ADMIN_TOKEN" "http://127.0.0.1:19091/v1/streams/0x$RAVEN_STREAM_ID/status" >/dev/null 2>&1 && break; sleep 1; done
   curl -fsS -H "Authorization: Bearer $RAVEN_WITNESS_ADMIN_TOKEN" "http://127.0.0.1:19091/v1/streams/0x$RAVEN_STREAM_ID/status" >/dev/null || fail "witness failed; inspect $LAB/witness/witness.log"
-  for _ in $(seq 1 60); do curl -fsS -H "Authorization: Bearer $RAVEN_ADMIN_TOKEN" http://127.0.0.1:19090/api/v1/integrity/status 2>/dev/null | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null && break; sleep 1; done
-  curl -fsS -H "Authorization: Bearer $RAVEN_ADMIN_TOKEN" http://127.0.0.1:19090/api/v1/integrity/status | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null || fail "RAVEN integrity stream differs from the isolated lab configuration"
+  for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:19090/api/v1/integrity/status 2>/dev/null | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null && break; sleep 1; done
+  curl -fsS http://127.0.0.1:19090/api/v1/integrity/status | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null || fail "RAVEN integrity stream differs from the isolated lab configuration"
 }
 stop() {
   if [[ -f "$LAB/compose-active" ]]; then
@@ -120,9 +119,13 @@ stop() {
   fi
   for f in "$LAB/raven.pid" "$LAB/witness.pid" "$LAB/anvil.pid"; do
     [[ -f "$f" ]] || continue; pid="$(cat "$f")"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    [[ "$pid" =~ ^[0-9]+$ && ${#pid} -le 10 ]] || fail "invalid PID in $f; refusing to signal it"
+    pid="$((10#$pid))"
+    (( pid > 1 )) || fail "invalid PID in $f; refusing to signal it"
+    if kill -0 "$pid" 2>/dev/null; then
       kill -TERM "$pid" 2>/dev/null || true
       for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      kill -0 "$pid" 2>/dev/null && fail "process $pid from $f did not stop; PID file was kept"
     fi
     rm -f "$f"
   done
@@ -138,7 +141,7 @@ case "${1:-help}" in
     deploy http://127.0.0.1:18545
     (cd "$ROOT/web" && npm ci && npm run build)
     docker compose --env-file "$LAB/lab.env" -p raven-blockchain-dev -f "$ROOT/docker-compose.blockchain.yaml" up -d --build witness raven ;;
-  status) set -a; source "$LAB/lab.env"; set +a; curl -fsS http://127.0.0.1:18080/api/v1/health; echo; curl -fsS -H "Authorization: Bearer $RAVEN_ADMIN_TOKEN" http://127.0.0.1:19090/api/v1/integrity/status; echo ;;
+  status) curl -fsS http://127.0.0.1:18080/api/v1/health; echo; curl -fsS http://127.0.0.1:19090/api/v1/integrity/status; echo ;;
   stop) stop ;;
   reset) [[ "${2:-}" == --yes ]] || fail "usage: $0 reset --yes (removes only $LAB)"; [[ "$LAB" == "$ROOT/data/blockchain-dev" && ! -L "$LAB" ]] || fail "refusing unsafe reset"; stop; rm -rf -- "$LAB"; echo "Removed $LAB" ;;
   benchmark)
@@ -155,7 +158,7 @@ case "${1:-help}" in
     ingest_ms=$(( (ingest_done_ns - started_ns) / 1000000 )); kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true
     max_rss_kb="$(sort -n "$LAB/rss-samples-kb.txt" | tail -1)"; max_rss_kb="${max_rss_kb:-0}"
     for _ in $(seq 1 90); do
-      lab_status="$(curl -fsS -H "Authorization: Bearer $RAVEN_ADMIN_TOKEN" http://127.0.0.1:19090/api/v1/integrity/status 2>/dev/null || true)"
+      lab_status="$(curl -fsS http://127.0.0.1:19090/api/v1/integrity/status 2>/dev/null || true)"
       echo "$lab_status" | jq -e '.local_head.batch_id > 0 and .chain_head.batch_id >= .local_head.batch_id and .backlog_count == 0' >/dev/null 2>&1 && break
       sleep 1
     done
@@ -164,7 +167,7 @@ case "${1:-help}" in
     catchup_ms=$(( (anchored_ns - ingest_done_ns) / 1000000 ))
     db="$(stat -f %z "$LAB/raven/raven.db" 2>/dev/null || echo 0)"; wal="$(stat -f %z "$LAB/raven/raven.db-wal" 2>/dev/null || echo 0)"
     audit_started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
-    "$LAB/bin/raven" integrity verify --ui http://127.0.0.1:19090 --admin-token "$RAVEN_ADMIN_TOKEN" --type fast --wait
+    "$LAB/bin/raven" integrity verify --ui http://127.0.0.1:19090 --type fast --wait
     audit_ms=$(( ($(python3 -c 'import time; print(time.monotonic_ns())') - audit_started_ns) / 1000000 ))
     throughput="$(awk -v n="$count" -v ms="$ingest_ms" 'BEGIN { printf "%.3f", n*1000/(ms>0?ms:1) }')"
     printf '{"events":%s,"concurrent_producers":4,"ingest_seconds":%.3f,"events_per_second":%s,"max_raven_rss_kb":%s,"sqlite_bytes":%s,"wal_bytes":%s,"backlog_catchup_seconds":%.3f,"fast_audit_seconds":%.3f}\n' "$count" "$(awk -v ms="$ingest_ms" 'BEGIN { printf "%.3f", ms/1000 }')" "$throughput" "$max_rss_kb" "$db" "$wal" "$(awk -v ms="$catchup_ms" 'BEGIN { printf "%.3f", ms/1000 }')" "$(awk -v ms="$audit_ms" 'BEGIN { printf "%.3f", ms/1000 }')" | tee -a "$LAB/benchmark.jsonl" ;;

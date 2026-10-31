@@ -21,7 +21,6 @@ import (
 )
 
 func TestEndToEnd_ReplayAndPacks(t *testing.T) {
-	t.Setenv("RAVEN_ADMIN_TOKEN", "integration-token")
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "raven.db")
 	outputPath := filepath.Join(tempDir, "normalized.ndjson")
@@ -150,7 +149,6 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 		"filename":     "app-order-service.yaml",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(actOrderBody))
-	req.Header.Set("Authorization", "Bearer integration-token")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -168,7 +166,6 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 		"filename":     "edge-waf.yaml",
 	})
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(actWafBody))
-	req.Header.Set("Authorization", "Bearer integration-token")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -178,7 +175,6 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 
 	// 3. Trigger Global Replay All
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/replay-all", nil)
-	req.Header.Set("Authorization", "Bearer integration-token")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

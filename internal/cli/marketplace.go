@@ -112,7 +112,6 @@ func MarketplaceCLI(args []string, packsDir, uiAddr string) {
 		if err != nil {
 			failMarketplace(err)
 		}
-		setMarketplaceAuth(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			failMarketplace(err)
@@ -132,7 +131,6 @@ func MarketplaceCLI(args []string, packsDir, uiAddr string) {
 		b, _ := json.Marshal(map[string]string{"name": name, "version": version})
 		req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/marketplace/fetch", bytes.NewReader(b))
 		req.Header.Set("Content-Type", "application/json")
-		setMarketplaceAuth(req)
 		resp, err := marketplaceHTTPClient().Do(req)
 		if err != nil {
 			failMarketplace(err)
@@ -172,7 +170,7 @@ func MarketplaceCLI(args []string, packsDir, uiAddr string) {
 func stripMarketplaceOptions(args []string) []string {
 	out := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--ui" || args[i] == "--packs-dir" || args[i] == "--admin-token" {
+		if args[i] == "--ui" || args[i] == "--packs-dir" {
 			i++
 			continue
 		}
@@ -197,7 +195,6 @@ func InstallMarketplacePackCLI(name, version, uiAddr string) {
 		failMarketplace(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	setMarketplaceAuth(req)
 	resp, err := marketplaceHTTPClient().Do(req)
 	if err != nil {
 		failMarketplace(err)
@@ -223,7 +220,6 @@ func RemoveMarketplacePackCLI(name, uiAddr string) {
 	if err != nil {
 		failMarketplace(err)
 	}
-	setMarketplaceAuth(req)
 	resp, err := marketplaceHTTPClient().Do(req)
 	if err != nil {
 		failMarketplace(err)
@@ -461,7 +457,6 @@ func upgradeRequest(uiAddr string, payload any) {
 		failMarketplace(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	setMarketplaceAuth(req)
 	resp, err := marketplaceHTTPClient().Do(req)
 	if err != nil {
 		failMarketplace(err)
@@ -529,7 +524,6 @@ func ListOutdatedMarketplacePacksCLI(uiAddr, packsDir string) {
 
 func getMarketplaceJSON(uiAddr, endpoint string, target any) error {
 	req, _ := http.NewRequest(http.MethodGet, GetBaseURL(uiAddr)+endpoint, nil)
-	setMarketplaceAuth(req)
 	resp, err := marketplaceHTTPClient().Do(req)
 	if err != nil {
 		return err
@@ -543,17 +537,4 @@ func getMarketplaceJSON(uiAddr, endpoint string, target any) error {
 
 func marketplaceHTTPClient() *http.Client { return &http.Client{Timeout: 12 * time.Second} }
 
-var marketplaceAdminToken string
-
-func SetMarketplaceAdminToken(token string) { marketplaceAdminToken = token }
-
-func setMarketplaceAuth(req *http.Request) {
-	token := marketplaceAdminToken
-	if token == "" {
-		token = os.Getenv("RAVEN_ADMIN_TOKEN")
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-}
 func failMarketplace(err error) { fmt.Fprintln(os.Stderr, "Marketplace:", err); os.Exit(1) }

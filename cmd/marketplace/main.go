@@ -38,6 +38,19 @@ type ownerMetadata struct {
 	Releases map[string]releaseMetadata `json:"releases"`
 }
 
+func metadataForRelease(metadata ownerMetadata, name, version string) (packCoverage, releaseMetadata, error) {
+	coverage, ok := metadata.Packs[name]
+	if !ok || strings.TrimSpace(coverage.Product) == "" {
+		return packCoverage{}, releaseMetadata{}, fmt.Errorf("marketplace metadata needs a product entry for pack %q", name)
+	}
+	releaseID := name + "@" + version
+	release, ok := metadata.Releases[releaseID]
+	if !ok || strings.TrimSpace(release.Changelog) == "" || len(release.RequiredDecoders) == 0 {
+		return packCoverage{}, releaseMetadata{}, fmt.Errorf("marketplace metadata needs changelog and required_decoders for release %q", releaseID)
+	}
+	return coverage, release, nil
+}
+
 func main() {
 	packDir := flag.String("packs", "packs", "directory of parser pack YAML")
 	metadataFile := flag.String("metadata", "marketplace/metadata.json", "owner-maintained vendor and model metadata")
@@ -121,8 +134,8 @@ func main() {
 		fatal(err)
 		sum := sha256.Sum256(data)
 		name := p.Metadata.Name
-		cover := metadata.Packs[name]
-		releaseMeta := metadata.Releases[name+"@"+p.Metadata.Version]
+		cover, releaseMeta, err := metadataForRelease(metadata, name, p.Metadata.Version)
+		fatal(err)
 		cat.Packs = append(cat.Packs, marketplace.Pack{
 			Name: name, Description: p.Metadata.Description, Publisher: p.Metadata.Author,
 			Category: p.Spec.SourceCategory, Format: p.Spec.Format,
@@ -178,7 +191,10 @@ func main() {
 					return nil
 				}
 			}
-			releaseMeta := metadata.Releases[p.Metadata.Name+"@"+p.Metadata.Version]
+			_, releaseMeta, e := metadataForRelease(metadata, p.Metadata.Name, p.Metadata.Version)
+			if e != nil {
+				return e
+			}
 			cat.Packs[i].Releases = append(cat.Packs[i].Releases, marketplace.Release{Version: p.Metadata.Version, Artifact: artifact, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data)), PackAPI: p.APIVersion, OCSF: ocsf.Version, Changelog: releaseMeta.Changelog, Withdrawn: releaseMeta.Withdrawn, MinRAVEN: releaseMeta.MinRAVEN, RequiredDecoders: releaseMeta.RequiredDecoders, PublishedAt: releaseMeta.PublishedAt})
 			releaseSource[artifact] = path
 			return nil

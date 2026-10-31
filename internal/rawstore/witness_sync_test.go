@@ -88,8 +88,13 @@ func TestWitnessSyncUploadsManifestAndVerifiesPinnedReceipt(t *testing.T) {
 	if err := store.SyncWitnessOnce(ctx, client, "http://witness.test", strings.Repeat("p", 32), strings.Repeat("a", 32), public); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DB().QueryRow(`SELECT state FROM integrity_witness_sync WHERE stream_id=? AND batch_id=1`, batch.Descriptor.StreamID[:]).Scan(&state); err != nil || state != "anchored" {
+	var storedAck []byte
+	if err := store.DB().QueryRow(`SELECT state,acknowledgement FROM integrity_witness_sync WHERE stream_id=? AND batch_id=1`, batch.Descriptor.StreamID[:]).Scan(&state, &storedAck); err != nil || state != "anchored" {
 		t.Fatalf("confirmed anchor was not persisted: state=%q err=%v", state, err)
+	}
+	storedWire, err := decodeStoredWitnessAck(storedAck)
+	if err != nil || storedWire.BatchID != 1 || storedWire.StreamID == "" {
+		t.Fatalf("refreshed acknowledgement was not stored in wire form: %+v %v", storedWire, err)
 	}
 }
 

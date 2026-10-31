@@ -3,8 +3,7 @@ info:
   title: RAVEN Integrity and Witness API
   version: 1.0.0-draft
   description: >-
-    Operator API for local evidence integrity, witness audits, and proofs.
-    Witness-admin forwarding uses a credential separate from the producer token.
+    Local evidence integrity, witness audits, and proofs. RAVEN management endpoints are unauthenticated and must stay on loopback or a trusted private network. Witness APIs use separate machine credentials for producer and admin operations.
 servers:
   - url: http://127.0.0.1:9090
     description: Native RAVEN management listener (loopback development default)
@@ -22,9 +21,6 @@ paths:
         Returns enabled or disabled status without exposing credentials or key
         material. A disabled feature and a never-run audit are not successful
         proof results.
-      security:
-        - RavenAdminKey: []
-        - RavenAdminBearer: []
       responses:
         '200':
           description: Current status; disabled is a valid status response.
@@ -32,10 +28,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/IntegrityStatus'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/AdminAuthNotConfigured'
 
   /api/v1/integrity/audits:
     post:
@@ -46,9 +38,6 @@ paths:
         Starts at most one active audit of each type. An identical request
         while that audit is active returns its existing run ID. Ledger audits
         are submitted to the witness; no request resets checkpoints or trust.
-      security:
-        - RavenAdminKey: []
-        - RavenAdminBearer: []
       requestBody:
         required: true
         content:
@@ -69,10 +58,6 @@ paths:
                 $ref: '#/components/schemas/AuditAccepted'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/AdminAuthNotConfigured'
         '409':
           description: Integrity mode is disabled.
           content:
@@ -96,9 +81,6 @@ paths:
       tags: [RAVEN integrity]
       operationId: getIntegrityAudit
       summary: Read audit progress or result
-      security:
-        - RavenAdminKey: []
-        - RavenAdminBearer: []
       responses:
         '200':
           description: Bounded audit status and captured target.
@@ -106,10 +88,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AuditRun'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/AdminAuthNotConfigured'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -131,9 +109,6 @@ paths:
         A known entry whose batch is still pending returns 200 with proof_state
         pending; unavailable trust services are reported explicitly. This is
         not equivalent to confirmed proof.
-      security:
-        - RavenAdminKey: []
-        - RavenAdminBearer: []
       responses:
         '200':
           description: Proof or an explicit pending/unavailable state.
@@ -141,10 +116,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProofResult'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/AdminAuthNotConfigured'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -365,15 +336,6 @@ paths:
 
 components:
   securitySchemes:
-    RavenAdminKey:
-      type: apiKey
-      in: header
-      name: X-RAVEN-Admin-Key
-      description: Existing RAVEN admin token header.
-    RavenAdminBearer:
-      type: http
-      scheme: bearer
-      description: Existing RAVEN admin token as a bearer token.
     WitnessProducerBearer:
       type: http
       scheme: bearer
@@ -421,13 +383,6 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
           example: {error: unauthorized}
-    AdminAuthNotConfigured:
-      description: Required admin credential is not configured.
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/Error'
-          example: {error: admin authentication is not configured}
     NotFound:
       description: Stream, batch, audit, or evidence entry is unknown.
       content:
