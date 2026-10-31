@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/raven-logo.png" alt="RAVEN logo" width="180">
+  <img src="assets/raven-logo.svg" alt="RAVEN logo" width="180">
 </p>
 
 # RAVEN — Reliable Audit Vault for Events and Network
@@ -7,12 +7,6 @@
 RAVEN accepts heterogeneous logs, keeps their original bytes in a local SQLite store, and converts recognized records into a versioned, OCSF-based JSON event with a link back to the original. Unknown, malformed, or ambiguous records are quarantined for inspection and replay after a parser pack is updated. This is a log preprocessor, not a SIEM, search engine, or production security boundary.
 
 The project includes a Go CLI/server, an embedded web management UI, YAML parser/source/sink definitions, and a synthetic log generator (`logsim`). Its signed parser marketplace lets users discover and install owner-published packs; internet access is opt-in. RAVEN can also run offline after the binary and configuration assets have been transferred. See [security guidance](SECURITY.md) before connecting real log sources.
-
-## Demo video
-
-[![Watch the RAVEN demo](assets/raven-thumbnail-video.png)](https://youtu.be/jXnHJfCAKP0)
-
-Click the thumbnail to watch the full demo on YouTube.
 
 ## Get started from source
 
