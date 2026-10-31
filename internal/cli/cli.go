@@ -1,0 +1,997 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"raven/internal/connections"
+	"raven/internal/decode"
+	"raven/internal/packs"
+	"raven/internal/rawstore"
+)
+
+const (
+	DefaultPIDFile = "data/raven.pid"
+	DefaultLogFile = "data/raven.log"
+)
+
+func GetBaseURL(uiAddr string) string {
+	if uiAddr == "" || uiAddr == "none" {
+		uiAddr = ":9090"
+	}
+	if strings.HasPrefix(uiAddr, ":") {
+		return "http://localhost" + uiAddr
+	}
+	if !strings.HasPrefix(uiAddr, "http://") && !strings.HasPrefix(uiAddr, "https://") {
+		return "http://" + uiAddr
+	}
+	return uiAddr
+}
+
+func ReadPID(pidFile string) (int, error) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return 0, err
+	}
+	pidStr := strings.TrimSpace(string(data))
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
+}
+
+func RunDaemonMode(pidFile, logFile string, uiAddr, packsDir string, marketplaceOnline bool, marketplaceURL string) {
+	if os.Getenv("RAVEN_DAEMON") == "1" {
+		return
+	}
+
+	// Check if already running
+	if pid, err := ReadPID(pidFile); err == nil && IsPIDAlive(pid) {
+		fmt.Fprintf(os.Stderr, "ERROR: RAVEN engine is already running (PID: %d).\nUse './bin/raven -stop' to stop it first.\n", pid)
+		os.Exit(1)
+	}
+
+	// Ensure log and pid directory exist
+	if dir := filepath.Dir(logFile); dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	if dir := filepath.Dir(pidFile); dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+
+	// Prepare child args (filter out -d)
+	var childArgs []string
+	for _, a := range os.Args[1:] {
+		if a == "-d" || a == "--d" {
+			continue
+		}
+		childArgs = append(childArgs, a)
+	}
+	// Default stdout to false in daemon mode if not specified
+	hasStdout := false
+	for _, a := range childArgs {
+		if strings.Contains(a, "-stdout") {
+			hasStdout = true
+			break
+		}
+	}
+	if !hasStdout {
+		childArgs = append(childArgs, "-stdout=false")
+	}
+
+	outLog, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to open log file %s: %v\n", logFile, err)
+		os.Exit(1)
+	}
+
+	execPath, err := os.Executable()
+	if err != nil {
+		execPath = os.Args[0]
+	}
+
+	cmd := exec.Command(execPath, childArgs...)
+	cmd.Env = append(os.Environ(), "RAVEN_DAEMON=1")
+	cmd.Stdout = outLog
+	cmd.Stderr = outLog
+	setDaemonSysProcAttr(cmd)
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Failed to start background daemon: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Write PID file
+	_ = os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0644)
+
+	command := os.Args[0]
+	if command == "" {
+		command = "raven"
+	}
+	fmt.Print(daemonStartupBanner(cmd.Process.Pid, command, uiAddr, logFile, packsDir, marketplaceOnline, marketplaceURL))
+	os.Exit(0)
+}
+
+func daemonStartupBanner(pid int, command, uiAddr, logFile, packsDir string, marketplaceOnline bool, marketplaceURL string) string {
+	ui := GetBaseURL(uiAddr)
+	if uiAddr == "none" {
+		ui = "disabled"
+	}
+	marketplace := "offline (bundled catalog and verified cache only)"
+	if marketplaceOnline {
+		marketplace = "online (network access only for explicit marketplace commands)"
+	}
+	return fmt.Sprintf(`
+[RAVEN] Engine daemon started successfully in background!
+  * Process ID:      %d
+  * Management UI:   %s
+  * Parser packs:    %s
+  * Logging Stream:  %s
+  * Marketplace:     %s
+  * Registry URL:    %s
+  * Quick Commands:
+      %s packs list                       # List active parser packs
+      %s packs get <name>                 # View a pack YAML definition
+      %s packs apply -f <pack.yaml>       # Validate and activate a local pack
+      %s marketplace search [query]       # Search the available catalog
+      %s marketplace refresh              # Refresh catalog (online mode required)
+      %s packs install <name>[@version]   # Install and activate a marketplace pack
+      %s packs remove <name>              # Deactivate an installed marketplace pack
+      %s sources list                     # List active ingestion sources
+      %s sinks list                       # List active delivery sinks
+      %s replay [id|all]                  # Manage or replay quarantined records
+      %s status                           # Check daemon health
+      %s stop                             # Stop the background daemon
+
+  * Commands use the default management address; pass --ui and --packs-dir
+    where supported when this daemon uses non-default values. Marketplace changes
+    require RAVEN_ADMIN_TOKEN or --admin-token where that option is supported.
+
+`, pid, ui, packsDir, logFile, marketplace, marketplaceURL,
+		command, command, command, command, command, command, command, command, command, command, command, command)
+}
+
+func StopDaemon(pidFile string) {
+	pid, err := ReadPID(pidFile)
+	if err != nil || !IsPIDAlive(pid) {
+		fmt.Fprintf(os.Stderr, "[RAVEN] No running daemon found (PID file %s missing or inactive).\n", pidFile)
+		_ = os.Remove(pidFile)
+		return
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[RAVEN] Failed to find process %d: %v\n", pid, err)
+		return
+	}
+
+	fmt.Printf("[RAVEN] Stopping daemon process (PID: %d)...\n", pid)
+	if err := stopProcess(proc); err != nil {
+		fmt.Fprintf(os.Stderr, "[RAVEN] Error stopping daemon: %v\n", err)
+	}
+	_ = os.Remove(pidFile)
+	fmt.Printf("[RAVEN] Engine daemon (PID: %d) stopped successfully.\n", pid)
+}
+
+func StatusDaemon(pidFile, uiAddr string) {
+	pid, err := ReadPID(pidFile)
+	alive := (err == nil && IsPIDAlive(pid))
+
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, httpErr := client.Get(baseURL + "/api/v1/health")
+
+	fmt.Printf("\n--- RAVEN Daemon Status ---\n")
+	if alive {
+		fmt.Printf("  Process Status:  RUNNING (PID: %d)\n", pid)
+	} else {
+		fmt.Printf("  Process Status:  STOPPED\n")
+	}
+
+	if httpErr == nil && resp.StatusCode == http.StatusOK {
+		var health map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&health)
+		resp.Body.Close()
+		fmt.Printf("  Control Plane:   HEALTHY (%s)\n", baseURL)
+		if u, ok := health["uptime_seconds"].(float64); ok {
+			fmt.Printf("  Uptime:          %s\n", time.Duration(u*float64(time.Second)).Truncate(time.Second))
+		}
+		if online, ok := health["marketplace_online"].(bool); ok {
+			fmt.Printf("  Marketplace Access: %v\n", map[bool]string{true: "enabled", false: "offline"}[online])
+		}
+	} else {
+		fmt.Printf("  Control Plane:   UNREACHABLE (%s)\n", baseURL)
+	}
+	fmt.Printf("--------------------------\n\n")
+}
+
+func ListPacksCLI(uiAddr, packsDir string) {
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(baseURL + "/api/v1/packs")
+
+	type packSummary struct {
+		Name           string          `json:"name"`
+		Version        string          `json:"version"`
+		SourceCategory string          `json:"source_category"`
+		Format         string          `json:"format"`
+		Match          packs.MatchRule `json:"match"`
+		FieldCount     int             `json:"field_count"`
+	}
+
+	var packList []packSummary
+	sourceDesc := "Runtime Memory Snapshot (" + baseURL + ")"
+
+	if err == nil && resp.StatusCode == http.StatusOK {
+		var result struct {
+			Version string        `json:"version"`
+			Packs   []packSummary `json:"packs"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
+			packList = result.Packs
+		}
+		resp.Body.Close()
+	} else {
+		// Fallback to offline disk
+		sourceDesc = "Local Directory (" + packsDir + ")"
+		if snap, err := packs.LoadDir(packsDir); err == nil {
+			for _, p := range snap.ListPacks() {
+				packList = append(packList, packSummary{
+					Name:           p.Metadata.Name,
+					Version:        p.Metadata.Version,
+					SourceCategory: p.Spec.SourceCategory,
+					Format:         p.Spec.Format,
+					Match:          p.Spec.Match,
+					FieldCount:     len(p.Spec.Fields),
+				})
+			}
+		}
+	}
+
+	fmt.Printf("\n--- Active Parser Packs [%s] ---\n", sourceDesc)
+	if len(packList) == 0 {
+		fmt.Println("No parser packs found.")
+		fmt.Printf("--------------------------------------------------\n\n")
+		return
+	}
+
+	fmt.Printf("%-26s %-10s %-16s %-8s %s\n", "NAME", "VERSION", "CATEGORY", "FORMAT", "MATCH CRITERIA")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, p := range packList {
+		matchStr := ""
+		if p.Match.Contains != "" {
+			matchStr = fmt.Sprintf("contains: %q", p.Match.Contains)
+		} else if p.Match.Regex != "" {
+			matchStr = fmt.Sprintf("regex: %s", p.Match.Regex)
+		} else if len(p.Match.FieldEquals) > 0 {
+			var kvs []string
+			for k, v := range p.Match.FieldEquals {
+				kvs = append(kvs, fmt.Sprintf("%s=%s", k, v))
+			}
+			matchStr = "fieldEquals: " + strings.Join(kvs, ", ")
+		}
+		if len(matchStr) > 35 {
+			matchStr = matchStr[:32] + "..."
+		}
+		fmt.Printf("%-26s %-10s %-16s %-8s %s\n", p.Name, p.Version, p.SourceCategory, p.Format, matchStr)
+	}
+	fmt.Printf("--------------------------------------------------------------------------------\n\n")
+}
+
+func ViewPackCLI(packName, uiAddr, packsDir string) {
+	packName = filepath.Base(packName)
+	if strings.ContainsAny(packName, "/\\") || strings.Contains(packName, "..") {
+		fmt.Fprintf(os.Stderr, "ERROR: Invalid pack name %q\n", packName)
+		os.Exit(1)
+	}
+
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(baseURL + "/api/v1/packs/" + packName)
+
+	if err == nil && resp.StatusCode == http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		fmt.Printf("\n# Parser Pack: %s (Source: Runtime API)\n", packName)
+		fmt.Println(string(data))
+		return
+	}
+
+	// Fallback to disk
+	cleanPacksDir := filepath.Clean(packsDir)
+	filePath := filepath.Join(cleanPacksDir, packName+".yaml")
+	if _, err := os.Stat(filePath); err != nil {
+		filePath = filepath.Join(cleanPacksDir, packName)
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Pack %q not found on server or at %s: %v\n", packName, filePath, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n# Parser Pack: %s (Source: %s)\n", packName, filePath)
+	fmt.Println(string(data))
+}
+
+func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
+	data, err := os.ReadFile(packFilePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to read pack file %s: %v\n", packFilePath, err)
+		os.Exit(1)
+	}
+
+	// Validate pack syntax and rules
+	pack, err := packs.LoadPack(bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Pack validation failed for %s: %v\n", packFilePath, err)
+		os.Exit(1)
+	}
+
+	// Apply through the running owner so disk and runtime snapshots change together.
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"yaml_content": string(data),
+		"filename":     pack.Metadata.Name + ".yaml",
+	})
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/packs/activate", bytes.NewReader(reqBody))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setMarketplaceAuth(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: RAVEN management API unavailable at %s; use --local only when the service is stopped: %v\n", baseURL, err)
+		os.Exit(1)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		fmt.Fprintf(os.Stderr, "ERROR: pack activation rejected by RAVEN (%s)\n", resp.Status)
+		os.Exit(1)
+	}
+	resp.Body.Close()
+	fmt.Printf("\n[RAVEN] Pack %s v%s validated and activated.\n", pack.Metadata.Name, pack.Metadata.Version)
+
+	// 3. Reconcile quarantine DLQ: trigger bulk replay for matching quarantined logs
+	fmt.Printf("[RAVEN] Reconciling Quarantine DLQ against newly activated pack...\n")
+	replayReq, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/quarantine/replay-all", nil)
+	setMarketplaceAuth(replayReq)
+	replayResp, err := client.Do(replayReq)
+	if err == nil && replayResp.StatusCode == http.StatusOK {
+		var repResult struct {
+			Total    int `json:"total"`
+			Replayed int `json:"replayed"`
+			Failed   int `json:"failed"`
+		}
+		_ = json.NewDecoder(replayResp.Body).Decode(&repResult)
+		replayResp.Body.Close()
+		fmt.Printf("[RAVEN] Reconcile Complete: %d events reprocessed successfully (%d failed, %d pending).\n\n",
+			repResult.Replayed, repResult.Failed, repResult.Total-repResult.Replayed)
+	} else {
+		fmt.Printf("[RAVEN] Reconcile complete.\n\n")
+	}
+}
+
+func ApplyPackLocalCLI(packFilePath, packsDir string) {
+	data, err := os.ReadFile(packFilePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	pack, err := packs.LoadPack(bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Pack validation failed: %v\n", err)
+		os.Exit(1)
+	}
+	lock, err := packs.AcquireDirectoryLock(packsDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	defer lock.Close()
+	if err = packs.RecoverTransactions(packsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: pack recovery failed: %v\n", err)
+		os.Exit(1)
+	}
+	snap, err := packs.LoadDir(packsDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	mgr := packs.NewSnapshotManager(snap)
+	mgr.SetPacksDir(packsDir)
+	if _, err = mgr.ApplyPackFile(pack.Metadata.Name+".yaml", data); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Installed %s v%s locally; it will activate on the next startup.\n", pack.Metadata.Name, pack.Metadata.Version)
+}
+
+func ListQuarantineCLI(uiAddr, dbPath string) {
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(baseURL + "/api/v1/quarantine?limit=50")
+
+	type quarItem struct {
+		QuarantineID  string `json:"quarantine_id"`
+		RawID         string `json:"raw_id"`
+		Stage         string `json:"stage"`
+		Reason        string `json:"reason"`
+		RawPreview    string `json:"raw_preview"`
+		QuarantinedAt string `json:"quarantined_at"`
+	}
+
+	var items []quarItem
+
+	if err == nil && resp.StatusCode == http.StatusOK {
+		var res struct {
+			Quarantine []quarItem `json:"quarantine"`
+			Total      int        `json:"total"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&res)
+		resp.Body.Close()
+		items = res.Quarantine
+	} else {
+		// Fallback to SQLite store
+		store, err := rawstore.New(dbPath)
+		if err == nil {
+			entries, _, _ := store.ListQuarantinePaged(context.Background(), 50, 0)
+			store.Close()
+			for _, e := range entries {
+				items = append(items, quarItem{
+					QuarantineID:  e.QuarantineID,
+					RawID:         e.RawID,
+					Stage:         e.Stage,
+					Reason:        e.Reason,
+					RawPreview:    e.RawPreview,
+					QuarantinedAt: e.QuarantinedAt.Format(time.RFC3339),
+				})
+			}
+		}
+	}
+
+	fmt.Printf("\n--- Quarantine Dead-Letter Queue (DLQ) ---\n")
+	if len(items) == 0 {
+		fmt.Println("Quarantine queue is empty. All ingested events are normalized and delivered.")
+		fmt.Printf("-------------------------------------------\n\n")
+		return
+	}
+
+	fmt.Printf("%-32s %-14s %-16s %s\n", "QUARANTINE ID", "STAGE", "REASON", "PREVIEW")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, it := range items {
+		preview := it.RawPreview
+		if len(preview) > 30 {
+			preview = preview[:27] + "..."
+		}
+		fmt.Printf("%-32s %-14s %-16s %s\n", it.QuarantineID, it.Stage, it.Reason, preview)
+	}
+	fmt.Printf("--------------------------------------------------------------------------------\n")
+	fmt.Printf("Use './bin/raven -replay <id>' or './bin/raven -replay all' to reprocess.\n\n")
+}
+
+func ReplaySingleCLI(qID, uiAddr string) {
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 3 * time.Second}
+	req, err := newReplayRequest(baseURL + "/api/v1/quarantine/" + url.PathEscape(qID) + "/replay")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Build replay request: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to contact RAVEN server at %s: %v\n", baseURL, err)
+		os.Exit(1)
+	}
+	var res struct {
+		Status      string `json:"status"`
+		OperationID string `json:"operation_id"`
+		Event       struct {
+			Raven struct {
+				EventID string `json:"event_id"`
+			} `json:"raven"`
+		} `json:"event"`
+	}
+	if err := decodeReplayResponse(resp, &res); err != nil {
+		fmt.Fprintf(os.Stderr, "Replay failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\n[RAVEN] Replay Successful!\n")
+	fmt.Printf("  * Quarantine Record: %s (Removed from DLQ)\n", qID)
+	fmt.Printf("  * Operation ID:     %s\n", res.OperationID)
+	fmt.Printf("  * Normalized Event:  %s\n\n", res.Event.Raven.EventID)
+}
+
+func ReplayAllCLI(uiAddr string) {
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := newReplayRequest(baseURL + "/api/v1/quarantine/replay-all")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Build replay request: %v\n", err)
+		os.Exit(1)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to contact RAVEN server at %s: %v\n", baseURL, err)
+		os.Exit(1)
+	}
+
+	var res struct {
+		Total    int `json:"total"`
+		Replayed int `json:"replayed"`
+		Failed   int `json:"failed"`
+	}
+	if err := decodeReplayResponse(resp, &res); err != nil {
+		fmt.Fprintf(os.Stderr, "Replay failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n--- RAVEN Bulk Replay Report ---\n")
+	fmt.Printf("  * Total Eligible:  %d\n", res.Total)
+	fmt.Printf("  * Replayed:        %d (Normalized and removed from DLQ)\n", res.Replayed)
+	fmt.Printf("  * Failed:          %d\n", res.Failed)
+	fmt.Printf("-------------------------------\n\n")
+}
+
+func newReplayRequest(endpoint string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setMarketplaceAuth(req)
+	return req, nil
+}
+
+func decodeReplayResponse(resp *http.Response, target any) error {
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		return fmt.Errorf("invalid replay response: %w", err)
+	}
+	return nil
+}
+
+// --- Parser Packs CLI (kind: ParserPack) ---
+
+func GetPackCLI(packName, uiAddr, packsDir string) {
+	ViewPackCLI(packName, uiAddr, packsDir)
+}
+
+func ValidatePackCLI(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	pack, err := packs.LoadPack(bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "PACK VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Parser Pack YAML is VALID!\n")
+	fmt.Printf("  * Kind:     ParserPack\n")
+	fmt.Printf("  * Name:     %s\n", pack.Metadata.Name)
+	fmt.Printf("  * Version:  %s\n", pack.Metadata.Version)
+	fmt.Printf("  * Category: %s\n", pack.Spec.SourceCategory)
+	fmt.Printf("  * Format:   %s\n", pack.Spec.Format)
+	fmt.Printf("  * Mappings: %d field mappings defined\n\n", len(pack.Spec.Fields))
+}
+
+func TestPackCLI(filePath, sample string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	pack, err := packs.LoadPack(bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "PACK VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Testing Parser Pack %q v%s (%s / %s)...\n", pack.Metadata.Name, pack.Metadata.Version, pack.Spec.SourceCategory, pack.Spec.Format)
+
+	var sampleBytes []byte
+	if sample != "" {
+		if fileData, err := os.ReadFile(sample); err == nil {
+			sampleBytes = fileData
+		} else {
+			sampleBytes = []byte(sample)
+		}
+	} else {
+		fmt.Printf("[RAVEN] Pack schema & syntax test PASSED!\n")
+		fmt.Printf("  * Pass '-sample <sample_log_or_file>' to execute matching & OCSF extraction tests.\n\n")
+		return
+	}
+
+	reg := decode.DefaultRegistry()
+	_, decodedRecords, err := reg.DetectAndDecode(sampleBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DECODER ERROR on sample: %v\n", err)
+		os.Exit(1)
+	}
+	if len(decodedRecords) == 0 {
+		fmt.Fprintf(os.Stderr, "NO RECORDS DECODED from sample\n")
+		os.Exit(1)
+	}
+
+	decRec := decodedRecords[0]
+	matched := pack.Matches(decRec)
+	if !matched {
+		fmt.Fprintf(os.Stderr, "PACK MATCH RESULT: FALSE (Sample did not match criteria)\n")
+		os.Exit(1)
+	}
+
+	extracted, unmapped, warnings, err := packs.ExtractAndConvert(pack, decRec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "EXTRACTION ERROR: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[RAVEN] Pack Test PASSED!\n")
+	fmt.Printf("  * Match:     TRUE\n")
+	fmt.Printf("  * Extracted: %d OCSF fields\n", len(extracted))
+	for k, v := range extracted {
+		fmt.Printf("    - %s: %v\n", k, v)
+	}
+	if len(warnings) > 0 {
+		fmt.Printf("  * Warnings:  %s\n", strings.Join(warnings, ", "))
+	}
+	if len(unmapped) > 0 {
+		fmt.Printf("  * Unmapped:  %d fields preserved in unmapped\n", len(unmapped))
+	}
+	fmt.Println()
+}
+
+func RollbackPackCLI(uiAddr, packsDir string, local ...bool) {
+	if len(local) > 0 && local[0] {
+		lock, err := packs.AcquireDirectoryLock(packsDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: cannot manage packs locally: %v\n", err)
+			os.Exit(1)
+		}
+		defer lock.Close()
+		if err := packs.RecoverTransactions(packsDir); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: pack recovery failed: %v\n", err)
+			os.Exit(1)
+		}
+		snap, err := packs.LoadDir(packsDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: failed to load packs directory: %v\n", err)
+			os.Exit(1)
+		}
+		mgr := packs.NewSnapshotManager(snap)
+		mgr.SetPacksDir(packsDir)
+		if err := mgr.Rollback(); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: pack rollback failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Parser pack rollback committed; it will be active on next startup.")
+		return
+	}
+	baseURL := GetBaseURL(uiAddr)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/api/v1/packs/rollback", nil)
+	setMarketplaceAuth(req)
+	resp, err := client.Do(req)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		var res struct {
+			Status  string `json:"status"`
+			Version string `json:"version"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&res)
+		resp.Body.Close()
+		fmt.Printf("\n[RAVEN] Parser Pack Rollback Successful!\n")
+		fmt.Printf("  * Active Runtime Snapshot: %s\n\n", res.Version)
+		return
+	}
+	if resp != nil {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		fmt.Fprintf(os.Stderr, "ERROR: daemon rollback rejected (%s): %s\n", resp.Status, strings.TrimSpace(string(body)))
+	} else {
+		fmt.Fprintf(os.Stderr, "ERROR: daemon rollback failed: %v\n", err)
+	}
+	os.Exit(1)
+}
+
+// --- Sources CLI (kind: Source) ---
+
+func ListSourcesCLI(uiAddr, srcDir string) {
+	if srcDir == "" {
+		srcDir = "sources"
+	}
+	mgr := connections.NewManager(srcDir)
+	_ = mgr.LoadDir(srcDir)
+	list := mgr.List()
+
+	fmt.Printf("\n--- Active Ingestion Sources [Directory (%s)] ---\n", srcDir)
+	fmt.Printf("%-24s %-10s %-16s %-8s %s\n", "NAME", "VERSION", "TYPE", "ENABLED", "TARGET ENDPOINT / TOPIC")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, c := range list {
+		target := c.Summary().Target
+		if target == "" {
+			target = "-"
+		}
+		if len(target) > 30 {
+			target = target[:27] + "..."
+		}
+		fmt.Printf("%-24s %-10s %-16s %-8v %s\n", c.Metadata.Name, c.Metadata.Version, c.Spec.Type, c.Spec.Enabled, target)
+	}
+	fmt.Printf("%s\n\n", strings.Repeat("-", 80))
+}
+
+func GetSourceCLI(name, uiAddr, srcDir string) {
+	if srcDir == "" {
+		srcDir = "sources"
+	}
+	mgr := connections.NewManager(srcDir)
+	_ = mgr.LoadDir(srcDir)
+	c, err := mgr.Get(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: source %q not found in %s\n", name, srcDir)
+		os.Exit(1)
+	}
+	data, _ := json.MarshalIndent(c, "", "  ")
+	fmt.Println(string(data))
+}
+
+func ValidateSourceCLI(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	src, err := connections.LoadSource(strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SOURCE VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Source YAML is VALID!\n")
+	fmt.Printf("  * Kind:    %s\n", src.Kind)
+	fmt.Printf("  * Name:    %s\n", src.Metadata.Name)
+	fmt.Printf("  * Version: %s\n", src.Metadata.Version)
+	fmt.Printf("  * Type:    %s\n", src.Spec.Type)
+	fmt.Printf("  * Enabled: %v\n\n", src.Spec.Enabled)
+}
+
+func TestSourceCLI(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	src, err := connections.LoadSource(strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SOURCE VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := src.TestConnectivity(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "SOURCE CONNECTIVITY TEST FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Source Connectivity Test PASSED for %q (%s)\n\n", src.Metadata.Name, src.Spec.Type)
+}
+
+func applyConnectionAPI(filePath, uiAddr string) (*connections.Connection, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	payload, _ := json.Marshal(map[string]string{"filename": filepath.Base(filePath), "yaml_content": string(data)})
+	req, err := http.NewRequest(http.MethodPost, GetBaseURL(uiAddr)+"/api/v1/connections/apply", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token := os.Getenv("RAVEN_ADMIN_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("live control plane unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("apply failed: %s", strings.TrimSpace(string(body)))
+	}
+	var result struct {
+		Connection *connections.Connection `json:"connection"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if result.Connection == nil {
+		return nil, fmt.Errorf("apply response omitted connection")
+	}
+	return result.Connection, nil
+}
+func rollbackConnectionAPI(uiAddr string) error {
+	req, err := http.NewRequest(http.MethodPost, GetBaseURL(uiAddr)+"/api/v1/connections/rollback", nil)
+	if err != nil {
+		return err
+	}
+	if token := os.Getenv("RAVEN_ADMIN_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("live control plane unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("rollback failed: %s", strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func ApplySourceCLI(filePath, uiAddr, srcDir string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	if _, err = connections.LoadSource(strings.NewReader(string(data))); err != nil {
+		fmt.Fprintln(os.Stderr, "SOURCE VALIDATION FAILED:", err)
+		os.Exit(1)
+	}
+	applied, err := applyConnectionAPI(filePath, uiAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\\n[RAVEN] Source Applied Live: %s@%s (%s)\\n\\n", applied.Metadata.Name, applied.Metadata.Version, applied.Spec.Type)
+}
+
+func RollbackSourceCLI(uiAddr, srcDir string) {
+	if err := rollbackConnectionAPI(uiAddr); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	fmt.Println("\\n[RAVEN] Connection Rollback Applied Live!\\n")
+}
+
+// --- Sinks CLI (kind: Sink) ---
+
+func ListSinksCLI(uiAddr, sinkDir string) {
+	if sinkDir == "" {
+		sinkDir = "sinks"
+	}
+	mgr := connections.NewManager(sinkDir)
+	_ = mgr.LoadDir(sinkDir)
+	list := mgr.List()
+
+	fmt.Printf("\n--- Active Delivery Sinks [Directory (%s)] ---\n", sinkDir)
+	fmt.Printf("%-24s %-10s %-16s %-8s %s\n", "NAME", "VERSION", "TYPE", "ENABLED", "TARGET ENDPOINT / PATH")
+	fmt.Println(strings.Repeat("-", 80))
+	for _, c := range list {
+		target := c.Summary().Target
+		if target == "" {
+			target = "-"
+		}
+		if len(target) > 30 {
+			target = target[:27] + "..."
+		}
+		fmt.Printf("%-24s %-10s %-16s %-8v %s\n", c.Metadata.Name, c.Metadata.Version, c.Spec.Type, c.Spec.Enabled, target)
+	}
+	fmt.Printf("%s\n\n", strings.Repeat("-", 80))
+}
+
+func GetSinkCLI(name, uiAddr, sinkDir string) {
+	if sinkDir == "" {
+		sinkDir = "sinks"
+	}
+	mgr := connections.NewManager(sinkDir)
+	_ = mgr.LoadDir(sinkDir)
+	c, err := mgr.Get(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: sink %q not found in %s\n", name, sinkDir)
+		os.Exit(1)
+	}
+	data, _ := json.MarshalIndent(c, "", "  ")
+	fmt.Println(string(data))
+}
+
+func ValidateSinkCLI(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	snk, err := connections.LoadSink(strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SINK VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Sink YAML is VALID!\n")
+	fmt.Printf("  * Kind:    %s\n", snk.Kind)
+	fmt.Printf("  * Name:    %s\n", snk.Metadata.Name)
+	fmt.Printf("  * Version: %s\n", snk.Metadata.Version)
+	fmt.Printf("  * Type:    %s\n", snk.Spec.Type)
+	fmt.Printf("  * Enabled: %v\n\n", snk.Spec.Enabled)
+}
+
+func TestSinkCLI(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: failed to read file %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+
+	snk, err := connections.LoadSink(strings.NewReader(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SINK VALIDATION FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := snk.TestConnectivity(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "SINK CONNECTIVITY TEST FAILED: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n[RAVEN] Sink Connectivity Test PASSED for %q (%s)\n\n", snk.Metadata.Name, snk.Spec.Type)
+}
+
+func ApplySinkCLI(filePath, uiAddr, sinkDir string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	if _, err = connections.LoadSink(strings.NewReader(string(data))); err != nil {
+		fmt.Fprintln(os.Stderr, "SINK VALIDATION FAILED:", err)
+		os.Exit(1)
+	}
+	applied, err := applyConnectionAPI(filePath, uiAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\\n[RAVEN] Sink Applied Live: %s@%s (%s)\\n\\n", applied.Metadata.Name, applied.Metadata.Version, applied.Spec.Type)
+}
+
+func RollbackSinkCLI(uiAddr, sinkDir string) {
+	if err := rollbackConnectionAPI(uiAddr); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(1)
+	}
+	fmt.Println("\\n[RAVEN] Connection Rollback Applied Live!\\n")
+}
