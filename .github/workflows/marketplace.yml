@@ -3,7 +3,7 @@ name: Publish parser marketplace
 on:
   push:
     branches: [main]
-    paths: ["packs/*.yaml", "marketplace/metadata.json", "marketplace/INDEX.md", "marketplace/releases/**", "cmd/marketplace/**", "internal/marketplace/**", "cmd/raven-witness/**", "internal/integrity/**", "internal/rawstore/**", "internal/witness/**", "internal/api/**", "internal/cli/**", "contracts/**", "config/blockchain-dev/**", "docker-compose.blockchain.yaml", "scripts/run-blockchain-dev.sh", "docs/integrity-operations.md", "web/src/pages/Integrity.tsx", "web/src/services/api.ts", "README.md", "MARKETPLACE.md", "CLI.md", "SECURITY.md", "BENCHMARKING.md", "assets/**", "scripts/build-release.*"]
+    paths: [".github/workflows/marketplace.yml", "packs/*.yaml", "marketplace/metadata.json", "marketplace/INDEX.md", "marketplace/releases/**", "cmd/marketplace/**", "internal/marketplace/**", "cmd/raven-witness/**", "internal/integrity/**", "internal/rawstore/**", "internal/witness/**", "internal/api/**", "internal/cli/**", "contracts/**", "config/blockchain-dev/**", "docker-compose.blockchain.yaml", "scripts/run-blockchain-dev.sh", "docs/integrity-operations.md", "web/src/pages/Integrity.tsx", "web/src/services/api.ts", "README.md", "MARKETPLACE.md", "CLI.md", "SECURITY.md", "BENCHMARKING.md", "assets/**", "scripts/build-release.*"]
   workflow_dispatch:
 
 permissions:
