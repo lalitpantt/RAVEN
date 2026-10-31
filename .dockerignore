@@ -1,0 +1,25 @@
+# Version control and local tooling
+.git
+.gitignore
+.vscode
+
+# Frontend dependencies and build output
+**/node_modules
+**/dist
+!web/dist/
+!web/dist/**
+**/.vite
+**/npm-debug.log*
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+simulator.yaml
+
+vendor/
+
+# Container and compose files not needed by the image build
+docker/
+docker-compose.yaml

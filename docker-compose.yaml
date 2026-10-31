@@ -1,0 +1,130 @@
+name: raven-simulation
+
+services:
+  # Core Universal Log Pre-processing Framework (RAVEN)
+  raven:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raven-core
+    ports:
+      - "1514:1514/udp"
+      - "1514:1514/tcp"
+      - "8080:8080/tcp"
+      - "9090:9090/tcp"
+    volumes:
+      - raven-data:/data
+      - raven-packs:/raven/packs
+      - raven-sources:/raven/sources
+      - raven-sinks:/raven/sinks
+    environment:
+      - RAVEN_LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 1. Simulates Palo Alto Firewall sending Syslog UDP
+  sim-firewall:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-firewall
+    command: ["--source", "firewall", "--scenario", "mixed", "--format", "syslog-udp", "--target", "raven:1514", "--rate", "2", "--count", "0"]
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 2. Simulates Cisco ASA Firewall sending Syslog UDP
+  sim-asa:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-asa
+    command: ["--source", "asa", "--scenario", "mixed", "--format", "syslog-udp", "--target", "raven:1514", "--rate", "2", "--count", "0"]
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 3. Simulates Linux SSHD / auth.log streaming Syslog TCP
+  sim-sshd:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-sshd
+    command: ["--source", "sshd", "--scenario", "bruteforce", "--format", "syslog-tcp", "--target", "raven:1514", "--rate", "1", "--count", "0"]
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 4. Simulates Suricata/Snort IDS alerts in CEF over Syslog UDP
+  sim-ids:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-ids
+    command: ["--source", "ids", "--scenario", "scan", "--format", "syslog-udp", "--target", "raven:1514", "--rate", "1", "--count", "0"]
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 5. Simulates Nginx Web Server writing Combined Log Format to spool inbox
+  sim-webserver:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-webserver
+    command: ["--source", "webserver", "--scenario", "mixed", "--format", "file", "--output-dir", "/data/inbox", "--rate", "2", "--count", "0"]
+    volumes:
+      - raven-data:/data
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 6. Simulates Payment Gateway microservice posting JSON events via HTTP REST
+  sim-app:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-app
+    command: ["--source", "app", "--scenario", "mixed", "--format", "http-post", "--target", "http://raven:8080/api/v1/ingest", "--rate", "4", "--count", "0"]
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+  # 7. Simulates Database Server generating CSV audit logs into spool inbox
+  sim-database:
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    container_name: sim-database
+    command: ["--source", "database", "--scenario", "mixed", "--format", "file", "--output-dir", "/data/inbox", "--rate", "1", "--count", "0"]
+    volumes:
+      - raven-data:/data
+    depends_on:
+      - raven
+    restart: unless-stopped
+    networks:
+      - raven-net
+
+
+networks:
+  raven-net:
+    driver: bridge
+
+volumes:
+  raven-data:
+  raven-packs:
+  raven-sources:
+  raven-sinks:

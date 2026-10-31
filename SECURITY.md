@@ -1,0 +1,27 @@
+# Security policy
+
+## Reporting a vulnerability
+
+Please do not publish exploit details, raw logs, credentials, or personal data in a public issue. Use GitHub's **Report a vulnerability** option under this repository's **Security** tab if it is enabled. If private reporting is unavailable, open a minimal issue requesting a private contact channel **without** technical details or secrets. Include the affected release/commit, impact, and reproduction steps only in the private report.
+
+Maintainers have not published a response-time or supported-version guarantee. For a fix, use the newest available release and verify its asset checksum; do not assume an older release receives backports.
+
+## Deployment warning
+
+RAVEN is currently a prototype. Native management, HTTP ingestion, and plaintext Syslog listeners default to loopback addresses. Explicitly binding them to a public/interface address changes that boundary: HTTP management is not TLS, HTTP ingestion accepts unauthenticated requests unless `-http-key` is set, and regular event listings remain readable. Use a trusted TLS-terminating proxy and network policy before remote exposure, require tokens where supported, and do not publish demo Compose ports to untrusted hosts.
+
+The management config response no longer returns the configured admin token; raw-event traces and connection probes require admin authorization; management JSON bodies are capped at 1 MiB. Sink outbox delivery now waits for each destination's flush, with at-least-once semantics (a destination can receive a duplicate if it accepted a write but the local acknowledgement could not be committed). SQLite WAL uses `synchronous=FULL` for the raw-store commit boundary. File-spool processing resumes files left in `processing/` and deduplicates already-committed offsets. These measures have regression tests, but do not replace live broker, remote SIEM, storage-failure, power-loss, or hosted-release validation.
+
+For a local-only native run, keep the defaults or explicitly use `-http 127.0.0.1:8080 -ui 127.0.0.1:9090` and disable unused Syslog listeners with `-syslog-udp none -syslog-tcp none -syslog-tls none`. Restrict database and file permissions; avoid putting credentials in shell history or checked-in YAML. Source/sink manifests should use `secretRef` and private environment/file secrets. Treat hash verification as a local consistency check, not proof against someone who can replace both data and stored hashes.
+
+## Parser marketplace trust and keys
+
+The official parser marketplace is a static registry at [https://ashokkmt.github.io/raven](https://ashokkmt.github.io/raven). Marketplace networking is disabled by default. Enable it only on a RAVEN instance that should refresh or download packs, using `--marketplace-online` and, for a private registry, `--marketplace-url <registry-root>`. RAVEN verifies the Ed25519 catalog signature against public keys embedded in the binary, then checks each downloaded YAML against the SHA-256 digest in that signed catalog before validating and activating it. Marketplace packs are YAML data; they do not run installer scripts or executable extensions.
+
+The owner must keep the Ed25519 private signing key outside Git, release archives, generated site files, customer machines, and chat transcripts. Local publishing reads the protected key file; GitHub Actions reads the key from the protected `marketplace-publish` environment secret `RAVEN_MARKETPLACE_SIGNING_KEY`. Restrict who can run or approve that environment. Never expose the secret to untrusted pull requests. Published versions are immutable; release changed YAML under a new version and retain old artifact bytes.
+
+Marketplace search is public. Refresh, fetch, install, upgrade, remove, and rollback requests that mutate the running instance require that customer's own RAVEN admin token. Configure it on the RAVEN server with `RAVEN_ADMIN_TOKEN` or `-admin-token`; set the same token in the operator's CLI environment or UI session when needed. This token authorizes only the customer's local management API. It is not sent to GitHub Pages and does not grant official publishing rights. Do not share it with the pack owner or include it in issue reports.
+
+Review a pack's vendor/model coverage and test its matching behavior before installing it. A valid signature proves the catalog was signed by a trusted key and an artifact matches its digest; it does not prove the pack's rules are correct for every source. An outdated offline catalog also cannot show later withdrawals until it is refreshed or replaced.
+
+Do not rely on this release as the only archive for regulated, forensic, or loss-intolerant logs. Keep an independent source archive and validate delivery and recovery in your own environment.
