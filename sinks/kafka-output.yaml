@@ -1,0 +1,19 @@
+apiVersion: raven.io/v1
+kind: Sink
+metadata:
+  name: normalized-kafka
+  version: 1.0.0
+  description: Kafka output topic for normalized OCSF events
+spec:
+  type: kafka_output
+  enabled: false
+  brokers:
+    - kafka:9092
+  topic: raven.normalized.v1
+  key: raven.source_id
+  acks: all
+  idempotent: true
+  compression: zstd
+  batchBytes: 1048576
+  linger: 5ms
+  secretRef: kafka-client-auth
