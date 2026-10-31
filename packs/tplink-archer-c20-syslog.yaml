@@ -1,0 +1,19 @@
+apiVersion: raven.io/v1
+kind: LogSource
+metadata:
+  name: tplink-archer-c20-syslog
+  version: 0.1.1
+  description: "Local parser for Archer C20 short-form DHCP and system syslog messages"
+  author: RAVEN Owner
+spec:
+  sourceCategory: network_device
+  format: syslog
+  match:
+    regex: '(?i)^\s*(?:DHCPD:\s+.+|DHCPC:\s+.+|HTTPD:\s+Clear log\.|SYSTEM:\s+.+)$'
+  fields:
+    event_message:
+      from: message
+      type: string
+  map:
+    event_message: event.message
+  preserveUnmapped: true
