@@ -50,6 +50,13 @@ jobs:
       - name: Add README homepage and its referenced files
         run: |
           { printf '%s\n' '---' '---' ''; cat README.md; } > marketplace-site/index.md
+          cat > marketplace-site/_config.yml <<'EOF'
+          title: RAVEN
+          description: Reliable Audit Vault for Events and Network
+          url: https://lalitpantt.github.io
+          baseurl: /RAVEN
+          theme: jekyll-theme-primer
+          EOF
           cp MARKETPLACE.md CLI.md SECURITY.md BENCHMARKING.md marketplace-site/
           mkdir -p marketplace-site/assets marketplace-site/scripts
           cp assets/raven-logo.svg marketplace-site/assets/
