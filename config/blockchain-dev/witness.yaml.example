@@ -1,0 +1,18 @@
+# Replace stream_id/genesis_hash with the values from the RAVEN integrity stream.
+listen_address: 127.0.0.1:9091
+database_path: data/blockchain-dev/witness/witness.db
+stream_id: 0x0000000000000000000000000000000000000000000000000000000000000001
+genesis_hash: 0x0000000000000000000000000000000000000000000000000000000000000001
+key_id: raven-local-witness-v1
+private_key_path: data/blockchain-dev/witness/receipt-key.b64
+producer_token_env: RAVEN_WITNESS_TOKEN
+admin_token_env: RAVEN_WITNESS_ADMIN_TOKEN
+rpc_url: http://127.0.0.1:8545
+chain_id: 31337
+# Replace each value using the pinned Anvil deployment identity.
+chain_genesis_block_hash: 0x0000000000000000000000000000000000000000000000000000000000000000
+contract_address: 0x0000000000000000000000000000000000000000
+deployment_block: 1
+deployment_block_hash: 0x0000000000000000000000000000000000000000000000000000000000000000
+runtime_code_hash: 0x0000000000000000000000000000000000000000000000000000000000000000
+anchor_private_key_env: RAVEN_ANCHOR_PRIVATE_KEY
