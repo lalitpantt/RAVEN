@@ -1,0 +1,72 @@
+name: raven-blockchain-dev
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.8.6
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337", "--state", "/state/anvil.json", "--preserve-historical-states"]
+    ports:
+      - "127.0.0.1:18545:8545"
+    volumes:
+      - ./data/blockchain-dev/anvil:/state
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  witness:
+    build:
+      context: .
+      dockerfile: docker/witness/Dockerfile
+    user: "${RAVEN_UID:-1000}:${RAVEN_GID:-1000}"
+    command: ["-config", "/lab/witness/witness-compose.yaml"]
+    environment:
+      RAVEN_WITNESS_TOKEN: "${RAVEN_WITNESS_TOKEN:-}"
+      RAVEN_WITNESS_ADMIN_TOKEN: "${RAVEN_WITNESS_ADMIN_TOKEN:-}"
+      RAVEN_ANCHOR_PRIVATE_KEY: "${RAVEN_ANCHOR_PRIVATE_KEY:-}"
+    volumes:
+      - ./data/blockchain-dev:/lab
+    depends_on:
+      anvil:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:19091:9091"
+    restart: unless-stopped
+
+  raven:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "${RAVEN_UID:-1000}:${RAVEN_GID:-1000}"
+    command: ["-db", "/data/raven.db", "-packs-dir", "/raven/packs", "-sources-dir", "/raven/sources", "-sinks-dir", "/raven/sinks", "-syslog-udp", ":1514", "-syslog-tcp", ":1514", "-http", ":8080", "-ui", ":9090", "-inbox", "/data/inbox", "-output-file", "/data/output/normalized.ndjson"]
+    environment:
+      RAVEN_ADMIN_TOKEN: "${RAVEN_ADMIN_TOKEN:-}"
+      RAVEN_STREAM_ID: "${RAVEN_STREAM_ID:-}"
+      RAVEN_INSTALLATION_EPOCH: "${RAVEN_INSTALLATION_EPOCH:-}"
+      RAVEN_WITNESS_URL: http://witness:9091
+      RAVEN_WITNESS_TOKEN: "${RAVEN_WITNESS_TOKEN:-}"
+      RAVEN_WITNESS_PUBLIC_KEY: /lab/witness/receipt-key.pub
+      RAVEN_WITNESS_ADMIN_TOKEN: "${RAVEN_WITNESS_ADMIN_TOKEN:-}"
+    volumes:
+      - ./data/blockchain-dev/raven:/data
+      - ./data/blockchain-dev:/lab:ro
+      - ./packs:/raven/packs:ro
+      - ./sources:/raven/sources:ro
+      - ./sinks:/raven/sinks:ro
+    depends_on:
+      witness:
+        condition: service_started
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:19090:9090"
+    restart: unless-stopped
+
+  sim-http:
+    profiles: [simulation]
+    build:
+      context: .
+      dockerfile: docker/sim/Dockerfile
+    command: ["--source", "app", "--scenario", "mixed", "--format", "http-post", "--target", "http://raven:8080/api/v1/ingest", "--rate", "10", "--count", "500"]
+    depends_on:
+      - raven

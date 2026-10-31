@@ -1,13 +1,12 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.25.0-alpine3.22 AS builder
 WORKDIR /src
-ENV GOPROXY=off GOSUMDB=off
 COPY go.mod go.sum ./
-COPY vendor/ ./vendor/
+RUN go mod download
 COPY internal/ ./internal/
 COPY cmd/raven/ ./cmd/raven/
 COPY web/embed.go ./web/embed.go
 COPY web/dist/ ./web/dist/
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o /bin/raven ./cmd/raven \
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/raven ./cmd/raven \
     && mkdir -p /image-data/inbox /image-data/output /image-packs
 
 FROM scratch
