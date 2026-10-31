@@ -40,7 +40,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/ingest -H 'Content-Type: application/j
 
 The raw database defaults to `data/raven.db`; normalized NDJSON defaults to `data/output/normalized.ndjson`. Stop the foreground server with Ctrl+C. `web/dist/` is generated and must be built before compiling the CLI on a fresh clone. A routine local build reports a `dev-<commit>` version; no release-version flag is needed.
 
-Native listeners default to loopback (`127.0.0.1`) so they are not remotely reachable by default. If you bind to a public/interface address, review [SECURITY.md](SECURITY.md), set the available ingestion/admin tokens, and put the plain-HTTP management UI behind a trusted TLS proxy.
+Native listeners default to loopback (`127.0.0.1`) so they are not remotely reachable by default. The management UI/API has no admin-token authentication: keep it on loopback or a trusted private network. If HTTP ingestion needs authentication, set `-http-key`. Review [SECURITY.md](SECURITY.md) before changing listener addresses.
 
 For an entirely local, one-shot example without network listeners:
 
@@ -74,7 +74,26 @@ Set-Location .\raven-release
 .\raven.exe -syslog-udp none -syslog-tcp none -syslog-tls none -http 127.0.0.1:8080 -ui 127.0.0.1:9090 -inbox none -stdout=false
 ```
 
-The UI is embedded in the binary. Cloud, Kafka, and external output integrations still need their respective services and credentials when enabled. For building your own tagged six-platform archives, see [`scripts/build-release.sh`](scripts/build-release.sh) and [`scripts/build-release.ps1`](scripts/build-release.ps1).
+The UI is embedded in the binary. Cloud, Kafka, and external output integrations still need their respective services and credentials when enabled.
+
+### Publish a six-platform RAVEN release
+
+The release workflow runs Go, UI, and Solidity checks, then creates six archives: Linux, macOS, and Windows for amd64 and arm64. Each contains one `raven` executable (`raven.exe` on Windows), an empty `packs/` directory, and `schemas/`, `sources/`, and `sinks/`. It does not ship the separate witness service, Anvil, Forge, Solidity sources, or local blockchain-lab configuration.
+
+From a clean, tested `main` checkout, build the same archives locally, then push a version tag to start the GitHub workflow:
+
+```sh
+source ~/.zshrc
+git switch main
+git pull --ff-only origin main
+git status --short
+scripts/build-release.sh vX.Y.Z
+(cd contracts && forge build && forge test)
+git tag -a vX.Y.Z -m "RAVEN vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Replace `vX.Y.Z` with the release version and make sure the worktree is clean before tagging. GitHub Actions publishes the six archives and `SHA256SUMS` to Releases after all checks pass. Do not add the generated `dist/` folder to Git.
 
 ### Start with marketplace access
 
@@ -87,7 +106,7 @@ Marketplace access is off by default. Add these startup flags when you want this
   --marketplace-url https://ashokkmt.github.io/raven
 ```
 
-Without `--marketplace-online`, RAVEN uses its signed catalog embedded in the binary and any verified cached downloads. The release starts with an empty local `packs/` directory; install packs from the marketplace or add your own YAML. Customers who manage packs through the UI or CLI need an admin token configured on their own RAVEN instance; the marketplace itself is public and never receives that token. See [MARKETPLACE.md](MARKETPLACE.md) for installation, publishing, and signing details, and [CLI.md](CLI.md) for every startup option and command.
+Without `--marketplace-online`, RAVEN uses its signed catalog embedded in the binary and any verified cached downloads. The release starts with an empty local `packs/` directory; install packs from the marketplace or add your own YAML. Pack management through the UI or CLI does not require an application admin token. Keep the management UI/API on loopback or a trusted private network; the marketplace itself is public. See [MARKETPLACE.md](MARKETPLACE.md) for installation, publishing, and signing details, and [CLI.md](CLI.md) for every startup option and command.
 
 ## What RAVEN handles
 
@@ -100,6 +119,25 @@ Without `--marketplace-online`, RAVEN uses its signed catalog embedded in the bi
 | Output | Stdout and NDJSON file by default; configurable HTTP SIEM, Kafka, Parquet, and NDJSON sinks through source/sink YAML and a SQLite-backed outbox. External delivery is at least once, so downstream systems should deduplicate by event ID. |
 
 `packs/`, `sources/`, `sinks/`, and `schemas/` in this repository are the configuration examples and validation assets. The browser UI offers event, trace, quarantine, parser-pack, and configuration views; the ingestion HTTP API and the UI/control API use separate listeners.
+
+## Evidence integrity and blockchain anchoring
+
+RAVEN can keep a second, append-only journal of raw-log arrivals, normalized versions, quarantine outcomes, and replay results. The journal is written alongside the existing SQLite transactions, so a crash cannot leave a committed log outcome without its matching evidence. It does not replace the raw database or change normal parsing and output behavior.
+
+Every five seconds at most, or sooner when a batch reaches 5,000 evidence entries, RAVEN seals the entries into an ordered Merkle batch. A separate `raven-witness` service retains the batch manifest and signs its acknowledgement. The local Ethereum contract then records the batch hash and Merkle root in sequence. The raw logs and normalized event contents stay in SQLite; only the commitment, stream identity, sequence range, count, and parent link are anchored. Local, witness, and chain heads are reported separately so a witness receipt is not mistaken for chain confirmation.
+
+Use the CLI to inspect the current state and run the three audit levels:
+
+```sh
+raven integrity status
+raven integrity verify --type fast --wait
+raven integrity verify --type deep --wait --wait-timeout 2m
+raven integrity verify --type ledger --wait --wait-timeout 2m
+```
+
+Fast checks the local evidence chain and data bindings. Deep also reconciles the journal with current database records. Ledger walks witness manifests and the configured chain history. Open the web console's **Integrity** tab for head positions, pending batches, audit progress, and evidence proofs. The CLI and UI call the running RAVEN management API; no admin token is required, so keep that listener private.
+
+Integrity is opt-in and needs a fresh stream identity plus witness/chain configuration. This repository's Anvil setup is a local simulation, not a public-chain deployment or a production trust boundary. Follow [plans/final-run.md](plans/final-run.md) for the tested native and Docker lab setup. A release archive contains the `raven` application and its normal configuration directories only: it does not bundle `raven-witness`, Anvil, Solidity sources, Forge, or blockchain-lab secrets/configuration. The integrity CLI, API, and UI remain part of RAVEN and report disabled until configured. Release CI tests the contract but does not package it.
 
 ## CLI commands, formats, and replay
 
@@ -123,7 +161,7 @@ raven replay QUARANTINE_ID           # replace with an ID from `raven replay`; o
 
 Use `raven marketplace search` and `show` to browse the catalog cached under the selected packs directory. Use `refresh` to update it, `fetch` to download without activation, `raven packs install` to validate and activate a release, and `remove` to deactivate a marketplace-managed pack from that RAVEN installation. These commands do not change the repository's owner source files. See [MARKETPLACE.md](MARKETPLACE.md) for the customer and owner workflows.
 
-The public catalog contains 124 unique parser packs across 116 researched source profiles and 131 published releases. Browse all packs and versions at the [online marketplace](https://ashokkmt.github.io/raven/packs/) or in the repository's [Marketplace Pack Index](marketplace/INDEX.md).
+The owner source tree has 126 parser packs and 133 published pack versions in its current metadata. Browse them at the [online marketplace](https://ashokkmt.github.io/raven/packs/) or in the repository's [Marketplace Pack Index](marketplace/INDEX.md).
 
 These are example placeholders: the pack must actually match a quarantined event. Pack activation currently also requests quarantine reconciliation; check its report before replaying an ID manually. Replay and live pack activation need the running management API. The `-verify` commands compare stored bytes/events to hashes in the same database; they are consistency checks, not independently anchored tamper-proof evidence.
 

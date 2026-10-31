@@ -9,6 +9,8 @@ Running `raven` starts RAVEN in the foreground. Listener defaults bind to loopba
 | Argument | Default | Purpose |
 |---|---|---|
 | `-db <file>` | `data/raven.db` | SQLite database for raw events, normalized events, quarantine, and delivery state. |
+| `-integrity-stream-id <hex>` | unset | Opt in to a fresh evidence stream; accepts a 32-byte hex identity. Defaults from `RAVEN_STREAM_ID`. |
+| `-integrity-installation-epoch <hex>` | unset | Installation epoch paired with the stream ID when enabling evidence journaling on a fresh database. Defaults from `RAVEN_INSTALLATION_EPOCH`. |
 | `-packs-dir <dir>` | `packs` | Active YAML parser packs and their hidden `.marketplace/` cache/management files. Paths are relative to the process working directory unless absolute. |
 | `-sources-dir <dir>` | `sources` | YAML source adapter definitions. |
 | `-sinks-dir <dir>` | `sinks` | YAML output adapter definitions. |
@@ -27,8 +29,7 @@ Running `raven` starts RAVEN in the foreground. Listener defaults bind to loopba
 | `-inbox <dir>` | `data/inbox` | Watched file-drop folder. `none` disables it. |
 | `-output-file <file>` | `data/output/normalized.ndjson` | Normalized NDJSON file output. `none` disables it. |
 | `-stdout[=true\|false]` | `true` | Print normalized NDJSON to the terminal. |
-| `-ui <address>` | `127.0.0.1:9090` | Web UI and management API. `none` disables live management. Management HTTP needs a trusted TLS proxy before remote exposure. |
-| `-admin-token <token>` | unset | Protects configured management write routes. Prefer setting `RAVEN_ADMIN_TOKEN` in the service environment so the secret is not in shell history. |
+| `-ui <address>` | `127.0.0.1:9090` | Unauthenticated web UI and management API. `none` disables live management. Keep it on loopback or a trusted private network. |
 | `--marketplace-online` | off | Allow explicit catalog refresh and missing-artifact downloads. No internet request is made without this option. |
 | `--marketplace-url <url>` | `https://ashokkmt.github.io/raven` | Marketplace registry root. Do not append `catalog.json`; RAVEN adds it. |
 | `-d` | foreground | Start detached and write `data/raven.pid` and `data/raven.log`. |
@@ -53,14 +54,7 @@ Use the startup arguments once when starting the service. For example, the offic
   -http 127.0.0.1:8080 -ui 127.0.0.1:9090
 ```
 
-To use a different static registry, add `--marketplace-url https://registry.example/root`. Marketplace write operations need an admin token configured on the running RAVEN. Set it before startup and in the shell used for CLI management:
-
-```sh
-export RAVEN_ADMIN_TOKEN="$(openssl rand -hex 32)"
-./bin/raven -ui 127.0.0.1:9090 --marketplace-online
-```
-
-Save the token securely if it must survive a restart. A token supplied only to the CLI does not configure the server. The UI's token input lasts only for that browser session.
+To use a different static registry, add `--marketplace-url https://registry.example/root`. Management actions do not require an application token; keep the UI/API bound to loopback or a trusted private network.
 
 Other useful modes:
 
@@ -77,6 +71,31 @@ Other useful modes:
 # Standard-input processing
 cat sample.log | ./bin/raven -stdin -syslog-udp none -syslog-tcp none -http none -ui none -inbox none
 ```
+
+## Evidence integrity and blockchain simulation
+
+Integrity mode appends evidence facts transactionally with RAVEN's existing SQLite writes. Entries cover raw-log arrival, normalized event versions, quarantine changes, and replay outcomes. A batch seals at 5,000 entries maximum or after roughly five seconds, whichever occurs first. RAVEN sends the ordered manifest and Merkle root to the separate witness; the witness retains it and submits the batch commitment to the configured EVM chain. Raw log bytes and normalized event payloads stay in RAVEN's database. The chain receives commitments and sequence metadata only.
+
+Check the evidence heads and run audits through the management API:
+
+```sh
+raven integrity status
+raven integrity verify --type fast --wait
+raven integrity verify --type deep --wait --wait-timeout 2m
+raven integrity verify --type ledger --wait --wait-timeout 2m
+```
+
+| Audit | Checks |
+|---|---|
+| `fast` | Walk the local evidence journal and verify its links to current raw and normalized data. |
+| `deep` | Perform a full bounded reconciliation of evidence history and database projections at a fixed snapshot. New writes during a scan can make that run incomplete; pause ingestion and retry for a stable snapshot. |
+| `ledger` | Walk retained witness manifests and sequential chain history, checking batch and block continuity. |
+
+`raven integrity status` shows the local journal head, witness receipt head, chain-confirmed head, and pending backlog. These heads may temporarily differ while anchoring catches up. `--wait` polls the durable audit result; exit status is 0 for passed, 1 for a detected mismatch, and 2 for unavailable or incomplete work. `--ui <address>` selects another management API address.
+
+Integrity is disabled unless a new stream ID and installation epoch are configured on a fresh RAVEN database. Witness and chain settings are provided by the local lab/service configuration, not by a separate `raven` CLI subcommand. The Anvil configuration in this repository is a development simulation; it is not a public-network deployment. See [plans/final-run.md](plans/final-run.md) for the complete native and Docker commands, dashboard, scans, and simulator.
+
+The GitHub release archives contain the RAVEN executable, not separate `raven-witness`, Anvil, Forge, Solidity contracts, or local blockchain secrets/configuration. The integrity CLI/API/UI are part of the RAVEN executable and remain disabled until configured. CI builds and tests the contract without attaching contract artifacts to release assets.
 
 ## Decoded formats
 
@@ -177,7 +196,7 @@ raven sinks apply -f sinks/http-siem.yaml
 raven sinks rollback
 ```
 
-`apply` and `rollback` contact the running management API on port 9090. Use the server's configured admin token for protected operations. Source/sink manifests may connect to external services when tested or enabled; use trusted files and configure secrets through `secretRef` and the documented secret environment/file mechanism.
+`apply` and `rollback` contact the running management API on port 9090. Management actions do not prompt for an admin token; keep this API private. Source/sink manifests may connect to external services when tested or enabled; use trusted files and configure secrets through `secretRef` and the documented secret environment/file mechanism.
 
 Unknown, malformed, or ambiguous logs remain in quarantine with their raw bytes. After adding and activating parser knowledge:
 

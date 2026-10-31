@@ -2,7 +2,7 @@
 
 RAVEN's parser marketplace is a public catalog of YAML parser packs maintained by the RAVEN owner. It gives users one place to search across many vendors, products, log formats, and documented models, then install only the packs they need. This lets the catalog grow independently of RAVEN binary releases when a pack uses an existing decoder. A format that needs a new decoder still needs a RAVEN code change and release.
 
-The catalog currently contains **124 unique parser packs across 116 researched source profiles**, with **131 published pack releases**. A source profile may reuse an existing parser identity when several vendor/model scopes share a format and matching rules. The marketplace does not install anything by itself: each RAVEN operator decides which packs to activate.
+The owner source tree currently contains **126 parser packs** and metadata for **133 versioned artifacts**. A source profile may reuse an existing parser identity when several vendor/model scopes share a format and matching rules. The marketplace does not install anything by itself: each RAVEN operator decides which packs to activate.
 
 ## Marketplace address and files
 
@@ -43,7 +43,7 @@ For a local-only or air-gapped run, omit `--marketplace-online`:
 
 RAVEN can search the signed catalog bundled in its binary and verified catalog/artifacts already cached under its packs directory. Refresh and uncached downloads need online access. No marketplace request happens during ordinary startup, ingestion, or cached search.
 
-Marketplace writes through the management API require an admin token configured for that RAVEN instance. A customer creates and protects their own token; it is unrelated to the owner's publishing key. For example, configure `RAVEN_ADMIN_TOKEN` in the service environment before starting RAVEN. Keep it private. CLI requests read `RAVEN_ADMIN_TOKEN`; the web UI accepts the same token for the current browser session. Do not put it in a shared command or in the marketplace.
+Marketplace management actions do not require an application admin token. Anyone who can reach the local RAVEN management API can change installed packs, so keep it bound to loopback or a trusted private network. This has no effect on the separate owner publishing key.
 
 ## How users browse and manage packs
 
@@ -125,6 +125,69 @@ When a current file still matches its latest signed version, preparation archive
 
 For a public release, commit the pack YAML, metadata, any previous-version archive, related fixtures/tests, and updated signed seed. Push the commit to `main`; `.github/workflows/marketplace.yml` runs checks and creates a fresh site from the committed files. It uses the `RAVEN_MARKETPLACE_SIGNING_KEY` secret from the protected `marketplace-publish` environment and deploys the resulting static files to GitHub Pages. A manual **Actions → Publish parser marketplace → Run workflow** run also uses the selected committed branch; it cannot see uncommitted files on a laptop, and the selected branch must be allowed by the `github-pages` environment deployment rules. The generated `marketplace-site/` directory is not committed.
 
+## First catalog regeneration and step-by-step public release
+
+After a signing-key rotation or a deliberate marketplace reset, the embedded seed can be empty while the owner metadata and pack files remain. The first publishing run below rebuilds the signed seed and index from those owner inputs. The marketplace workflow is enabled in GitHub Actions and expects its signing key in the `marketplace-publish` environment.
+
+1. Start in the repository and make sure the signing key file exists. Do not print its contents or commit it:
+
+   ```sh
+   cd /Users/ashok/projects/raven
+   source ~/.zshrc
+   test -s "$HOME/.config/raven/marketplace-signing-key.b64"
+   chmod 600 "$HOME/.config/raven/marketplace-signing-key.b64"
+   git status --short
+   ```
+
+2. Check pack YAML and tests. For a changed existing pack in future releases, run `-prepare-release` **before editing that YAML** so the prior bytes are archived and the version is advanced. For a new pack, add both a `packs/<name>.yaml` file and matching `packs` and `releases` entries in `marketplace/metadata.json`.
+
+   ```sh
+   go test ./...
+   ```
+
+3. Rebuild the signed seed, generated `marketplace/INDEX.md`, and static site. This command checks every pack/release metadata reference and verifies the private key matches the public key trusted by RAVEN. It signs locally; it does not publish anything to GitHub Pages:
+
+   ```sh
+   go run ./cmd/marketplace \
+     -packs packs \
+     -metadata marketplace/metadata.json \
+     -out internal/marketplace/catalog-seed.json \
+     -site marketplace-site \
+     -key-file "$HOME/.config/raven/marketplace-signing-key.b64"
+   go run ./cmd/marketplace -check-packs
+   ```
+
+   Review the generated catalog/index counts and the changed files. Keep `marketplace-site/` local; it is an ignored build output. Preserve `marketplace/releases/<name>/<version>.yaml` for every historical release listed in metadata.
+
+4. In repository **Settings → Environments**, create or open the `marketplace-publish` environment. Save the same base64 private key as an environment secret. With GitHub CLI authenticated, this sends the file directly without displaying the value:
+
+   ```sh
+   gh secret set RAVEN_MARKETPLACE_SIGNING_KEY \
+     --repo ashokkmt/raven \
+     --env marketplace-publish \
+     < "$HOME/.config/raven/marketplace-signing-key.b64"
+   gh secret list --repo ashokkmt/raven --env marketplace-publish
+   ```
+
+   Alternatively, in GitHub open **Settings → Environments → marketplace-publish → Add environment secret**, name it `RAVEN_MARKETPLACE_SIGNING_KEY`, and paste the file's single base64 line. Configure **Settings → Pages** to use GitHub Actions. The deploy job uses the `github-pages` environment; make sure its protection rules permit the intended `main` deployment.
+
+5. Commit the source inputs, generated signed seed/index, prior release archives, and workflow/docs updates. Push to `main`; the marketplace workflow verifies and builds the site, then deploys it:
+
+   ```sh
+   git status --short
+   git diff --check
+   git add packs marketplace/metadata.json marketplace/INDEX.md marketplace/releases \
+     internal/marketplace/catalog-seed.json README.md CLI.md MARKETPLACE.md SECURITY.md \
+     .github/workflows/marketplace.yml
+   git commit -m "Publish RAVEN parser marketplace"
+   git push origin main
+   gh run list --repo ashokkmt/raven --workflow marketplace.yml --limit 5
+   ```
+
+   Open the matching run and wait for both the build and Pages deployment jobs to pass; `gh run watch <run-id> --repo ashokkmt/raven --exit-status` follows a selected run. To rebuild/deploy the latest committed branch without a new pack change, run **Actions → Publish parser marketplace → Run workflow** or `gh workflow run marketplace.yml --repo ashokkmt/raven --ref main`.
+
+The marketplace registry is separate from GitHub Release binaries. This publish workflow deploys the signed catalog, pack YAML artifacts, and documentation to Pages; it does not create or attach blockchain-lab binaries. See the root [README](README.md#publish-a-six-platform-raven-release) for the separately tagged RAVEN CLI release.
+
 To retire a pack, mark each of its published releases `"withdrawn": true` in `marketplace/metadata.json`, preserve the old YAML artifacts and catalog history, and remove its current YAML from root `packs/` when it should stop appearing in future marketplace catalogs. Update affected tests and the signed seed, then publish the catalog update through the same workflow. After users refresh, they cannot newly install withdrawn releases. The update never reaches into their computers to uninstall an active pack; each customer decides when to remove it.
 
 The commands above describe the public owner workflow; the local test and published workflow use the same publisher inputs and signing checks.
@@ -135,6 +198,6 @@ The owner keeps an Ed25519 private key outside the repository and customer machi
 
 RAVEN verifies the catalog signature before trusting its pack names, versions, and download paths. Each YAML artifact also has a SHA-256 digest in the signed catalog; RAVEN checks the exact downloaded bytes against that digest, then validates the YAML before activating it. The signature establishes that the catalog came from a trusted publisher; the digest detects changed or damaged artifact bytes. Downloads use registry-relative paths and do not execute code.
 
-Customers' admin tokens authorize changes to their own RAVEN API. Those tokens are never sent to the public registry. They do not grant publishing rights and cannot sign a catalog. The signing key is for the owner only.
+Local management actions require no application admin token. The public registry never receives local management credentials. Local API access does not grant publishing rights and cannot sign a catalog; the signing key is for the owner only.
 
 Signing protects the origin and integrity of marketplace metadata and artifacts. It does not prove a pack's parsing rules are correct or safe for every log stream; review coverage and test packs with representative data before activation. See [SECURITY.md](SECURITY.md) for deployment and credential guidance.

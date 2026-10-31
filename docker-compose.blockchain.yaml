@@ -41,7 +41,6 @@ services:
     user: "${RAVEN_UID:-1000}:${RAVEN_GID:-1000}"
     command: ["-db", "/data/raven.db", "-packs-dir", "/raven/packs", "-sources-dir", "/raven/sources", "-sinks-dir", "/raven/sinks", "-syslog-udp", ":1514", "-syslog-tcp", ":1514", "-http", ":8080", "-ui", ":9090", "-inbox", "/data/inbox", "-output-file", "/data/output/normalized.ndjson"]
     environment:
-      RAVEN_ADMIN_TOKEN: "${RAVEN_ADMIN_TOKEN:-}"
       RAVEN_STREAM_ID: "${RAVEN_STREAM_ID:-}"
       RAVEN_INSTALLATION_EPOCH: "${RAVEN_INSTALLATION_EPOCH:-}"
       RAVEN_WITNESS_URL: http://witness:9091
