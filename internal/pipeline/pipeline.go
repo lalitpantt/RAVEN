@@ -82,6 +82,7 @@ type Pipeline struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	submitMu     sync.Mutex
+	replayMu     sync.Mutex
 	submitClosed bool
 	submitDone   chan struct{}
 	submitWG     sync.WaitGroup
@@ -693,29 +694,59 @@ func (p *Pipeline) deliverPending() {
 
 // Replay retrieves a quarantined event by its quarantine ID, verifies cryptographic
 // integrity, and re-processes it through the pipeline with currently active parser packs.
-func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEvent, error) {
-	entry, err := p.store.GetQuarantineByID(ctx, qID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve quarantine entry %s: %w", qID, err)
+func (p *Pipeline) Replay(ctx context.Context, qID string) (result *model.NormalizedEvent, replayErr error) {
+	result, _, replayErr = p.ReplayWithOperation(ctx, qID, "")
+	return result, replayErr
+}
+
+func (p *Pipeline) ReplayWithOperation(ctx context.Context, qID, operationID string) (result *model.NormalizedEvent, returnedOperationID string, replayErr error) {
+	p.replayMu.Lock()
+	defer p.replayMu.Unlock()
+	if p.store == nil {
+		return nil, "", errors.New("raw store unavailable for replay")
 	}
+	operation, err := p.store.BeginReplay(ctx, qID, operationID)
+	if err != nil {
+		return nil, operationID, err
+	}
+	returnedOperationID = operation.ID
+	if operation.State == "completed" {
+		var saved model.NormalizedEvent
+		if err := json.Unmarshal(operation.ResultJSON, &saved); err != nil {
+			return nil, returnedOperationID, fmt.Errorf("decode saved replay result: %w", err)
+		}
+		return &saved, returnedOperationID, nil
+	}
+	entry := operation.Entry
+	var replayEntry *model.QuarantineEntry
+	var parserDigest *[32]byte
+	recordFailure := true
+	defer func() {
+		if replayErr != nil && recordFailure && replayEntry != nil {
+			if err := p.store.RecordReplayFailureWithProvenance(ctx, replayEntry, replayErr, returnedOperationID, parserDigest); err != nil {
+				replayErr = fmt.Errorf("%w; failed to persist replay failure evidence: %v", replayErr, err)
+			}
+		}
+	}()
+	replayEntry = entry
 
 	rawEvt, err := p.store.Retrieve(ctx, entry.RawID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve raw event %s: %w", entry.RawID, err)
+		return nil, returnedOperationID, fmt.Errorf("failed to retrieve raw event %s: %w", entry.RawID, err)
 	}
 
 	matches, _, err := p.store.Verify(ctx, entry.RawID)
 	if err != nil || !matches {
-		return nil, fmt.Errorf("cryptographic integrity check failed for raw event %s", entry.RawID)
+		return nil, returnedOperationID, fmt.Errorf("cryptographic integrity check failed for raw event %s", entry.RawID)
 	}
 
 	// Run through detection, decoding, matching, and normalization
 	decoder, decodedRecords, err := p.registry.DetectAndDecode(rawEvt.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("replay decode failed: %w", err)
+		return nil, returnedOperationID, fmt.Errorf("replay decode failed: %w", err)
 	}
 	if len(decodedRecords) == 0 {
-		return nil, fmt.Errorf("no decoded records produced upon replay")
+		return nil, returnedOperationID, fmt.Errorf("no decoded records produced upon replay")
 	}
 
 	// BA-005: Select the specific child record matching entry.RecordOrdinal
@@ -727,22 +758,24 @@ func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEve
 		}
 	}
 	if decRec == nil {
-		decRec = decodedRecords[0]
+		return nil, returnedOperationID, fmt.Errorf("stored child ordinal %d is missing from replay decode", entry.RecordOrdinal)
 	}
 
 	// BA-009: Capture snapshot once
 	if p.packManager == nil {
-		return nil, fmt.Errorf("no active parser pack snapshot available for replay")
+		return nil, returnedOperationID, fmt.Errorf("no active parser pack snapshot available for replay")
 	}
 	snap := p.packManager.Active()
 	if snap == nil {
-		return nil, fmt.Errorf("no active parser pack snapshot available for replay")
+		return nil, returnedOperationID, fmt.Errorf("no active parser pack snapshot available for replay")
 	}
 
 	pack, err := snap.Match(decRec)
 	if err != nil {
-		return nil, fmt.Errorf("replay pack match failed: %w", err)
+		return nil, returnedOperationID, fmt.Errorf("replay pack match failed: %w", err)
 	}
+	digest := pack.SourceSHA256
+	parserDigest = &digest
 
 	history := []model.ProcessingStep{
 		{Stage: "raw_commit", Timestamp: rawEvt.ReceivedAt, Result: "ok"},
@@ -753,11 +786,11 @@ func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEve
 
 	norm, err := p.normalizer.Normalize(rawEvt, decRec, pack, history)
 	if err != nil {
-		return nil, fmt.Errorf("replay normalization failed: %w", err)
+		return nil, returnedOperationID, fmt.Errorf("replay normalization failed: %w", err)
 	}
 
 	if err := p.validator.Validate(norm); err != nil {
-		return nil, fmt.Errorf("replay validation failed: %w", err)
+		return nil, returnedOperationID, fmt.Errorf("replay validation failed: %w", err)
 	}
 
 	destinations := []string(nil)
@@ -766,10 +799,18 @@ func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEve
 	}
 	// Resolve quarantine and store delivery intent in one database transaction.
 	if p.store != nil {
-		if err := p.store.ResolveQuarantineWithOutbox(ctx, qID, norm, destinations); err != nil {
-			return nil, fmt.Errorf("failed to commit replay result: %w", err)
+		if err := p.store.ResolveQuarantineWithOutboxOperation(ctx, qID, norm, destinations, returnedOperationID); err != nil {
+			if committed, lookupErr := p.store.BeginReplay(ctx, qID, returnedOperationID); lookupErr == nil && committed.State == "completed" {
+				var saved model.NormalizedEvent
+				if decodeErr := json.Unmarshal(committed.ResultJSON, &saved); decodeErr == nil {
+					recordFailure = false
+					return &saved, returnedOperationID, nil
+				}
+			}
+			return nil, returnedOperationID, fmt.Errorf("failed to commit replay result: %w", err)
 		}
 	}
+	recordFailure = false
 
 	// Update pipeline loss accounting counters
 	if p.quarantined.Load() > 0 {
@@ -778,7 +819,7 @@ func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEve
 	p.normalized.Add(1)
 	if p.durableSink == nil {
 		if err := p.sink.Emit(ctx, norm); err != nil {
-			return nil, err
+			return nil, returnedOperationID, err
 		}
 		p.delivered.Add(1)
 	} else {
@@ -787,7 +828,7 @@ func (p *Pipeline) Replay(ctx context.Context, qID string) (*model.NormalizedEve
 		default:
 		}
 	}
-	return norm, nil
+	return norm, returnedOperationID, nil
 }
 
 // Stats returns a snapshot of loss accounting counters and verifies the invariant.

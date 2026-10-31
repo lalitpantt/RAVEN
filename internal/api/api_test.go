@@ -15,6 +15,7 @@ import (
 
 	"raven/internal/api"
 	"raven/internal/connections"
+	"raven/internal/integrity"
 	"raven/internal/model"
 	"raven/internal/packs"
 	"raven/internal/pipeline"
@@ -90,6 +91,77 @@ spec:
 
 	srv := api.NewServer("127.0.0.1:0", store, pipe, packMgr, packsDir, cfg, mockFS, "test-version")
 	return srv, store, pipe, tempDir
+}
+
+func TestAPI_IntegrityOperatorAuthJobsAndPendingProof(t *testing.T) {
+	t.Setenv("RAVEN_ADMIN_TOKEN", "operator-secret")
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+	handler := srv.Handler()
+	request := func(method, path, body, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	if got := request(http.MethodGet, "/api/v1/integrity/status", "", ""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("missing operator auth status=%d", got.Code)
+	}
+	if got := request(http.MethodGet, "/api/v1/integrity/status", "", "operator-secret"); got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"enabled":false`) {
+		t.Fatalf("disabled status: %d %s", got.Code, got.Body.String())
+	}
+	if got := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`, "operator-secret"); got.Code != http.StatusConflict {
+		t.Fatalf("disabled audit status=%d body=%s", got.Code, got.Body.String())
+	}
+	var stream, epoch integrity.Hash
+	stream[0], epoch[0] = 3, 4
+	if err := store.EnableIntegrity(context.Background(), stream, epoch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Store(context.Background(), model.IngestedRecord{Transport: "test", RawBytes: []byte("evidence"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	started := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"fast"}`, "operator-secret")
+	if started.Code != http.StatusAccepted {
+		t.Fatalf("start audit: %d %s", started.Code, started.Body.String())
+	}
+	var accepted struct {
+		RunID string `json:"run_id"`
+		Type  string `json:"type"`
+	}
+	if err := json.Unmarshal(started.Body.Bytes(), &accepted); err != nil || accepted.RunID == "" || accepted.Type != "fast" {
+		t.Fatalf("bad accepted response: %+v %v", accepted, err)
+	}
+	var completed *httptest.ResponseRecorder
+	for i := 0; i < 100; i++ {
+		completed = request(http.MethodGet, "/api/v1/integrity/audits/"+accepted.RunID, "", "operator-secret")
+		if strings.Contains(completed.Body.String(), `"state":"completed"`) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if completed == nil || completed.Code != http.StatusOK || !strings.Contains(completed.Body.String(), `"result":"passed"`) {
+		t.Fatalf("audit did not pass: %v", completed)
+	}
+	proof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "", "operator-secret")
+	if proof.Code != http.StatusOK || !strings.Contains(proof.Body.String(), `"proof_state":"pending"`) || !strings.Contains(proof.Body.String(), `"reason":"entry batch is not sealed"`) {
+		t.Fatalf("pending proof response: %d %s", proof.Code, proof.Body.String())
+	}
+	if _, err := store.SealIntegrityBatch(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	sealedProof := request(http.MethodGet, "/api/v1/integrity/proofs/1", "", "operator-secret")
+	if sealedProof.Code != http.StatusOK || !strings.Contains(sealedProof.Body.String(), `"batch_id":1`) || !strings.Contains(sealedProof.Body.String(), `"leaf_index":0`) {
+		t.Fatalf("sealed inclusion proof: %d %s", sealedProof.Code, sealedProof.Body.String())
+	}
+	if bad := request(http.MethodPost, "/api/v1/integrity/audits", `{"type":"unbounded"}`, "operator-secret"); bad.Code != http.StatusBadRequest {
+		t.Fatalf("invalid audit type status=%d", bad.Code)
+	}
 }
 
 func TestAPI_HealthAndStats(t *testing.T) {
@@ -339,6 +411,13 @@ func TestAPI_QuarantineReplayAll(t *testing.T) {
 	if resp["total"].(float64) != 0 || resp["replayed"].(float64) != 0 {
 		t.Fatalf("expected total 0 replayed 0, got %+v", resp)
 	}
+	badKey := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/replay-all", nil)
+	badKey.Header.Set("Idempotency-Key", strings.Repeat("x", 129))
+	badKeyResponse := httptest.NewRecorder()
+	handler.ServeHTTP(badKeyResponse, badKey)
+	if badKeyResponse.Code != http.StatusBadRequest {
+		t.Fatalf("expected oversized idempotency key to be rejected, got %d", badKeyResponse.Code)
+	}
 
 	// 2. Test GET /api/v1/packs/{name}
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/packs/test-firewall", nil)
@@ -349,6 +428,104 @@ func TestAPI_QuarantineReplayAll(t *testing.T) {
 	}
 	if !bytes.Contains(rec.Body.Bytes(), []byte("test-firewall")) {
 		t.Fatalf("expected YAML to contain test-firewall, got: %s", rec.Body.String())
+	}
+}
+
+func TestAPI_ReplayIdempotencyKeyReturnsSavedResult(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+	ctx := context.Background()
+	var stream, epoch integrity.Hash
+	stream[0], epoch[0] = 7, 8
+	if err := store.EnableIntegrity(ctx, stream, epoch); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("<166>Sep 20 10:10:15 asa-gw-01 %ASA-6-302013: Built inbound TCP connection 2914823")
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog", RawBytes: payload, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-api-idempotent", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "parser_match", Reason: "retry", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	request := func(key string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/q-api-idempotent/replay", nil)
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	first := request("")
+	operationID := first.Header().Get("Idempotency-Key")
+	if first.Code != http.StatusOK || operationID == "" || !bytes.Contains(first.Body.Bytes(), []byte(`"operation_id":"`+operationID+`"`)) {
+		t.Fatalf("first replay failed: status=%d header=%q body=%s", first.Code, first.Header().Get("Idempotency-Key"), first.Body.String())
+	}
+	second := request(operationID)
+	if second.Code != http.StatusOK || !bytes.Equal(first.Body.Bytes(), second.Body.Bytes()) {
+		t.Fatalf("retry did not return saved result: first=%s second=%s status=%d", first.Body.String(), second.Body.String(), second.Code)
+	}
+	var completed, normalized, outboxCount int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE operation_id=? AND state='completed'`, operationID).Scan(&completed)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normalized)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&outboxCount)
+	if completed != 1 || normalized != 1 || outboxCount != 0 {
+		t.Fatalf("retry duplicated side effects: completed=%d normalized=%d outbox=%d", completed, normalized, outboxCount)
+	}
+	entries, err := store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil || len(entries) != 4 || entries[3].Kind != integrity.ReplayResolved || entries[3].OperationID != operationID {
+		t.Fatalf("replay evidence does not bind operation: entries=%+v err=%v", entries, err)
+	}
+	metadata, err := integrity.DecodeFields(entries[2].MetadataSnapshot)
+	if err != nil || len(metadata) != 5 || metadata[2].Type != integrity.FieldBytes32 || len(metadata[2].Value) != 32 {
+		t.Fatalf("normalized evidence omitted captured parser digest: metadata=%+v err=%v", metadata, err)
+	}
+	if stats := pipe.Stats(); stats.Normalized != 1 || stats.Delivered != 1 {
+		t.Fatalf("retry changed pipeline accounting: %+v", stats)
+	}
+}
+
+func TestAPI_ConcurrentReplayWithSameKeyResolvesOnce(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+	ctx := context.Background()
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog", RawBytes: []byte("<166>Sep 20 10:10:15 asa-gw-01 %ASA-6-302013: Built inbound TCP connection 2914823"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-concurrent-replay", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "parser_match", Reason: "retry", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() {
+			<-start
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/q-concurrent-replay/replay", nil)
+			req.Header.Set("Idempotency-Key", "concurrent-operation")
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, req)
+			results <- rec
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	if first.Code != http.StatusOK || second.Code != http.StatusOK || !bytes.Equal(first.Body.Bytes(), second.Body.Bytes()) {
+		t.Fatalf("concurrent retry mismatch: first=%d %s second=%d %s", first.Code, first.Body.String(), second.Code, second.Body.String())
+	}
+	var operations, normalized int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE operation_id='concurrent-operation' AND state='completed'`).Scan(&operations)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normalized)
+	if operations != 1 || normalized != 1 || pipe.Stats().Normalized != 1 || pipe.Stats().Delivered != 1 {
+		t.Fatalf("concurrent replay duplicated work: operations=%d normalized=%d stats=%+v", operations, normalized, pipe.Stats())
 	}
 }
 

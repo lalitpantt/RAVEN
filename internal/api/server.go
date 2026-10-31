@@ -3,8 +3,10 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -22,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/mod/semver"
 	"raven/internal/connections"
@@ -58,19 +61,25 @@ type IngestTracker interface {
 
 // Server provides the Management Control Plane REST API and embedded UI.
 type Server struct {
-	addr          string
-	store         *rawstore.RawStore
-	pipe          *pipeline.Pipeline
-	packManager   *packs.SnapshotManager
-	marketplace   marketplace.LocalStore
-	packsDir      string
-	connManager   *connections.Manager
-	connsDir      string
-	cfgInfo       ConfigInfo
-	version       string
-	distFS        fs.FS
-	startTime     time.Time
-	ingestTracker IngestTracker
+	addr              string
+	store             *rawstore.RawStore
+	pipe              *pipeline.Pipeline
+	packManager       *packs.SnapshotManager
+	marketplace       marketplace.LocalStore
+	packsDir          string
+	connManager       *connections.Manager
+	connsDir          string
+	cfgInfo           ConfigInfo
+	version           string
+	distFS            fs.FS
+	startTime         time.Time
+	ingestTracker     IngestTracker
+	witnessURL        string
+	witnessAdminToken string
+	auditCtx          context.Context
+	auditCancel       context.CancelFunc
+	auditMu           sync.Mutex
+	auditWG           sync.WaitGroup
 
 	statsMu      sync.Mutex
 	lastAccepted int64
@@ -131,6 +140,12 @@ func (s *Server) SetIngestTracker(t IngestTracker) {
 	s.ingestTracker = t
 }
 
+// SetIntegrityWitness configures separate witness-admin forwarding credentials.
+func (s *Server) SetIntegrityWitness(baseURL, adminToken string) {
+	s.witnessURL = strings.TrimRight(baseURL, "/")
+	s.witnessAdminToken = adminToken
+}
+
 // SetConnManager attaches a connection manager and directory.
 func (s *Server) SetConnManager(mgr *connections.Manager, dir string) {
 	s.connManager = mgr
@@ -167,7 +182,7 @@ func (s *Server) requireConfiguredAdminAuth(next http.HandlerFunc) http.HandlerF
 			token = os.Getenv("RAVEN_ADMIN_TOKEN")
 		}
 		if token == "" {
-			s.jsonError(w, http.StatusForbidden, "marketplace management requires RAVEN_ADMIN_TOKEN or --admin-token")
+			s.jsonError(w, http.StatusForbidden, "admin management requires RAVEN_ADMIN_TOKEN or --admin-token")
 			return
 		}
 		provided := r.Header.Get("X-RAVEN-Admin-Key")
@@ -219,6 +234,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/connections/apply", s.requireAdminAuth(s.handleApplyConnection))
 	mux.HandleFunc("POST /api/v1/connections/rollback", s.requireAdminAuth(s.handleRollbackConnection))
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
+	mux.HandleFunc("GET /api/v1/integrity/status", s.requireConfiguredAdminAuth(s.handleIntegrityStatus))
+	mux.HandleFunc("POST /api/v1/integrity/audits", s.requireConfiguredAdminAuth(s.handleStartIntegrityAudit))
+	mux.HandleFunc("GET /api/v1/integrity/audits/{run_id}", s.requireConfiguredAdminAuth(s.handleGetIntegrityAudit))
+	mux.HandleFunc("GET /api/v1/integrity/proofs/{entry_seq}", s.requireConfiguredAdminAuth(s.handleIntegrityProof))
 
 	// Static UI routing with SPA client-side fallback
 	mux.HandleFunc("/", s.handleStaticOrSPA)
@@ -256,10 +275,17 @@ func (s *Server) Start() error {
 
 // Stop gracefully shuts down the management server.
 func (s *Server) Stop(ctx context.Context) error {
+	var err error
 	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+		err = s.httpServer.Shutdown(ctx)
 	}
-	return nil
+	s.auditMu.Lock()
+	if s.auditCancel != nil {
+		s.auditCancel()
+	}
+	s.auditMu.Unlock()
+	s.auditWG.Wait()
+	return err
 }
 
 // Addr returns the bound listener address.
@@ -586,27 +612,34 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request) 
 		s.jsonError(w, http.StatusInternalServerError, "pipeline not available for replay")
 		return
 	}
-
-	// Verify replay eligibility
-	entry, err := s.store.GetQuarantineByID(r.Context(), qID)
-	if err != nil {
-		s.jsonError(w, http.StatusNotFound, "quarantine entry not found: "+err.Error())
-		return
-	}
-	if !entry.ReplayEligible {
-		s.jsonError(w, http.StatusBadRequest, "quarantine entry is marked ineligible for replay")
+	key := r.Header.Get("Idempotency-Key")
+	if len(key) > 128 || (key != "" && (!utf8.ValidString(key) || strings.IndexByte(key, 0) >= 0)) {
+		s.jsonError(w, http.StatusBadRequest, "Idempotency-Key must be at most 128 valid UTF-8 bytes without NUL")
 		return
 	}
 
-	norm, err := s.pipe.Replay(r.Context(), qID)
+	norm, operationID, err := s.pipe.ReplayWithOperation(r.Context(), qID, key)
+	if len(operationID) > 128 {
+		operationID = ""
+	}
+	if operationID != "" {
+		w.Header().Set("Idempotency-Key", operationID)
+	}
 	if err != nil {
-		s.jsonError(w, http.StatusBadRequest, "replay failed: "+err.Error())
+		status := http.StatusBadRequest
+		if errors.Is(err, rawstore.ErrReplayOperationConflict) || errors.Is(err, rawstore.ErrReplayAlreadyFailed) {
+			status = http.StatusConflict
+		} else if errors.Is(err, rawstore.ErrReplayTargetNotFound) {
+			status = http.StatusNotFound
+		}
+		s.jsonResponse(w, status, map[string]any{"error": "replay failed: " + err.Error(), "operation_id": operationID})
 		return
 	}
 
 	s.jsonResponse(w, http.StatusOK, map[string]any{
 		"status":        "replayed",
 		"quarantine_id": qID,
+		"operation_id":  operationID,
 		"event":         norm,
 	})
 }
@@ -614,6 +647,11 @@ func (s *Server) handleReplayQuarantine(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleReplayAllQuarantine(w http.ResponseWriter, r *http.Request) {
 	if s.pipe == nil {
 		s.jsonError(w, http.StatusInternalServerError, "pipeline not available for replay")
+		return
+	}
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if len(idempotencyKey) > 128 || (idempotencyKey != "" && (!utf8.ValidString(idempotencyKey) || strings.IndexByte(idempotencyKey, 0) >= 0)) {
+		s.jsonError(w, http.StatusBadRequest, "Idempotency-Key must be at most 128 valid UTF-8 bytes without NUL")
 		return
 	}
 
@@ -628,6 +666,7 @@ func (s *Server) handleReplayAllQuarantine(w http.ResponseWriter, r *http.Reques
 	failedCount := 0
 	type replayDetail struct {
 		QuarantineID string `json:"quarantine_id"`
+		OperationID  string `json:"operation_id"`
 		Status       string `json:"status"`
 		EventID      string `json:"event_id,omitempty"`
 		Error        string `json:"error,omitempty"`
@@ -635,11 +674,17 @@ func (s *Server) handleReplayAllQuarantine(w http.ResponseWriter, r *http.Reques
 	var details []replayDetail
 
 	for _, id := range ids {
-		norm, err := s.pipe.Replay(r.Context(), id)
+		opID := ""
+		if idempotencyKey != "" {
+			sum := sha256.Sum256([]byte(idempotencyKey + "\x00" + id))
+			opID = "bulk-" + hex.EncodeToString(sum[:])
+		}
+		norm, operationID, err := s.pipe.ReplayWithOperation(r.Context(), id, opID)
 		if err != nil {
 			failedCount++
 			details = append(details, replayDetail{
 				QuarantineID: id,
+				OperationID:  operationID,
 				Status:       "failed",
 				Error:        err.Error(),
 			})
@@ -651,6 +696,7 @@ func (s *Server) handleReplayAllQuarantine(w http.ResponseWriter, r *http.Reques
 			}
 			details = append(details, replayDetail{
 				QuarantineID: id,
+				OperationID:  operationID,
 				Status:       "replayed",
 				EventID:      evtID,
 			})

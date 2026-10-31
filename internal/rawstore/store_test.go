@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"raven/internal/integrity"
 	"raven/internal/model"
 	"raven/internal/outbox"
 )
@@ -25,6 +29,877 @@ func setupTestStore(t *testing.T) *RawStore {
 		_ = store.Close()
 	})
 	return store
+}
+
+func enableTestIntegrity(t *testing.T, store *RawStore) {
+	t.Helper()
+	var stream, epoch integrity.Hash
+	stream[0], epoch[0] = 1, 2
+	if err := store.EnableIntegrity(context.Background(), stream, epoch); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStartIntegrityAuditCoalescesOnlyActiveRuns(t *testing.T) {
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	ctx := context.Background()
+	first, active, err := store.StartIntegrityAudit(ctx, false)
+	if err != nil || active {
+		t.Fatalf("first audit: active=%v err=%v", active, err)
+	}
+	duplicate, active, err := store.StartIntegrityAudit(ctx, false)
+	if err != nil || !active || duplicate.RunID != first.RunID {
+		t.Fatalf("duplicate audit did not coalesce: %+v active=%v err=%v", duplicate, active, err)
+	}
+	if result, err := store.RunIntegrityAudit(ctx, first.RunID); err != nil || result != "passed" {
+		t.Fatalf("run local audit: result=%q err=%v", result, err)
+	}
+	next, active, err := store.StartIntegrityAudit(ctx, false)
+	if err != nil || active || next.RunID == first.RunID {
+		t.Fatalf("completed audit was reused: %+v active=%v err=%v", next, active, err)
+	}
+}
+
+func insertSealerTestEntries(t *testing.T, store *RawStore, count, subjectPad int, age time.Duration) {
+	t.Helper()
+	tx, err := store.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var streamBytes []byte
+	var firstSeq uint64
+	if err := tx.QueryRow(`SELECT stream_id,next_entry_seq FROM integrity_streams WHERE singleton=1`).Scan(&streamBytes, &firstSeq); err != nil {
+		t.Fatal(err)
+	}
+	var stream integrity.Hash
+	copy(stream[:], streamBytes)
+	metadata, err := integrity.EncodeFields(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentFields := []integrity.TypedField{fieldText(1, "replay_failed"), fieldBytes32(2, integrity.HashContent([]byte("test failure")))}
+	content, err := integrity.EncodeFields(contentFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentDigest, metadataDigest := integrity.HashContent(content), integrity.HashContent(metadata)
+	insert, err := tx.Prepare(`INSERT INTO integrity_entries(stream_id,entry_seq,entry_kind,subject_id,occurred_at_unix_ns,content_snapshot,metadata_snapshot,content_digest,metadata_digest,encoded_entry,leaf_hash,committed_at) VALUES(?,?,?, ?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer insert.Close()
+	committedAt := time.Now().UTC().Add(-age)
+	for i := 0; i < count; i++ {
+		seq := firstSeq + uint64(i)
+		subject := fmt.Sprintf("test-%04d-%s", i, strings.Repeat("s", subjectPad))
+		entry := integrity.EvidenceEntry{Version: integrity.CodecVersion, StreamID: stream, Sequence: seq, Kind: integrity.ReplayFailed, SubjectID: &subject, OccurredAtUnixNS: committedAt.UnixNano(), ContentDigest: contentDigest, MetadataDigest: metadataDigest}
+		encoded, err := integrity.EncodeEvidenceEntry(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf := integrity.MerkleLeaf(encoded)
+		if _, err := insert.Exec(streamBytes, seq, integrity.ReplayFailed, subject, entry.OccurredAtUnixNS, content, metadata, contentDigest[:], metadataDigest[:], encoded, leaf[:], committedAt.Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE integrity_streams SET next_entry_seq=? WHERE singleton=1`, firstSeq+uint64(count)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegritySchemaFutureVersionAndFreshEnable(t *testing.T) {
+	store := setupTestStore(t)
+	var version int
+	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != CurrentSchemaVersion {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	for _, table := range []string{"integrity_streams", "integrity_entries", "integrity_batches", "integrity_batch_entries", "integrity_witness_sync", "integrity_operations", "integrity_audit_runs", "integrity_findings"} {
+		var count int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("table %s missing: count=%d err=%v", table, count, err)
+		}
+	}
+	var committedAtColumn int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('integrity_entries') WHERE name='committed_at'`).Scan(&committedAtColumn); err != nil || committedAtColumn != 1 {
+		t.Fatalf("integrity entry append timestamp missing: count=%d err=%v", committedAtColumn, err)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER integrity_stream_identity_no_update;
+		ALTER TABLE integrity_streams DROP COLUMN enabled_at;
+		CREATE TRIGGER integrity_stream_identity_no_update BEFORE UPDATE OF stream_id,codec_version,installation_epoch,genesis_hash,enabled ON integrity_streams BEGIN SELECT RAISE(ABORT,'integrity stream identity is immutable'); END;
+		ALTER TABLE integrity_entries DROP COLUMN committed_at;
+		PRAGMA user_version=5`); err != nil {
+		t.Fatalf("prepare schema v5 database: %v", err)
+	}
+	if err := initSchema(store.DB()); err != nil {
+		t.Fatalf("migrate schema v5 timestamp column: %v", err)
+	}
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('integrity_entries') WHERE name='committed_at'`).Scan(&committedAtColumn); err != nil || committedAtColumn != 1 {
+		t.Fatalf("schema v5 migration did not add commit timestamp: count=%d err=%v", committedAtColumn, err)
+	}
+	enableTestIntegrity(t, store)
+	var enabledAtColumns int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('integrity_streams') WHERE name='enabled_at'`).Scan(&enabledAtColumns); err != nil || enabledAtColumns != 1 {
+		t.Fatalf("integrity enable time missing after schema v7 migration: columns=%d err=%v", enabledAtColumns, err)
+	}
+	if _, err := store.DB().Exec(`UPDATE integrity_streams SET enabled_at='2000-01-01T00:00:00Z'`); err == nil {
+		t.Fatal("integrity enable time was mutable")
+	}
+	if err := initSchema(store.DB()); err != nil {
+		t.Fatalf("reopen migrated schema: %v", err)
+	}
+	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA user_version=8`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initSchema(store.DB()); err == nil {
+		t.Fatal("future database schema was accepted")
+	}
+	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 8 {
+		t.Fatalf("future schema version changed: version=%d err=%v", version, err)
+	}
+}
+
+func TestIntegrityBatchSealerPersistsContiguousFullBatch(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	store.stopIntegritySealer()
+	insertSealerTestEntries(t, store, integrity.MaxBatchEntries, 0, 0)
+	batch, err := store.SealIntegrityBatch(ctx, false)
+	if err != nil || batch == nil {
+		t.Fatalf("seal full batch: batch=%+v err=%v", batch, err)
+	}
+	if batch.Descriptor.BatchID != 1 || batch.Descriptor.FirstSeq != 1 || batch.Descriptor.LastSeq != integrity.MaxBatchEntries || batch.Descriptor.LeafCount != integrity.MaxBatchEntries || len(batch.Manifest) > maxManifestBytes {
+		t.Fatalf("unexpected sealed descriptor: %+v manifest_bytes=%d", batch.Descriptor, len(batch.Manifest))
+	}
+	var manifest batchManifest
+	if err := json.Unmarshal(batch.Manifest, &manifest); err != nil || len(manifest.Entries) != integrity.MaxBatchEntries {
+		t.Fatalf("invalid persisted manifest: entries=%d err=%v", len(manifest.Entries), err)
+	}
+	rows, err := store.DB().Query(`SELECT entry_seq,leaf_hash FROM integrity_batch_entries WHERE stream_id=(SELECT stream_id FROM integrity_streams WHERE singleton=1) AND batch_id=1 ORDER BY leaf_index`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaves := make([]integrity.Hash, 0, integrity.MaxBatchEntries)
+	for i := 0; rows.Next(); i++ {
+		var seq uint64
+		var leaf []byte
+		if err := rows.Scan(&seq, &leaf); err != nil {
+			t.Fatal(err)
+		}
+		if seq != uint64(i+1) {
+			t.Fatalf("membership gap at index %d: seq=%d", i, seq)
+		}
+		var h integrity.Hash
+		copy(h[:], leaf)
+		leaves = append(leaves, h)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root, err := integrity.MerkleRoot(leaves)
+	if err != nil || root != batch.Descriptor.MerkleRoot {
+		t.Fatalf("batch root does not match ordered membership: root=%x err=%v", root, err)
+	}
+	wantHash, err := integrity.HashBatchDescriptor(batch.Descriptor)
+	if err != nil || wantHash != batch.BatchHash {
+		t.Fatalf("batch hash mismatch: got=%x want=%x err=%v", batch.BatchHash, wantHash, err)
+	}
+	var sealed, queued, lastSeq, nextBatch int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_batches`).Scan(&sealed)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_witness_sync WHERE state='pending'`).Scan(&queued)
+	_ = store.DB().QueryRow(`SELECT last_sealed_seq,next_batch_id FROM integrity_streams WHERE singleton=1`).Scan(&lastSeq, &nextBatch)
+	if sealed != 1 || queued != 1 || lastSeq != integrity.MaxBatchEntries || nextBatch != 2 {
+		t.Fatalf("batch head or witness queue is incomplete: batches=%d queued=%d last=%d next=%d", sealed, queued, lastSeq, nextBatch)
+	}
+	if duplicate, err := store.SealIntegrityBatch(ctx, true); err != nil || duplicate != nil {
+		t.Fatalf("already-sealed prefix was duplicated: batch=%+v err=%v", duplicate, err)
+	}
+}
+
+func TestIntegrityBatchSealerFlushesAtBodyLimitAndPreservesNextPrefix(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	store.stopIntegritySealer()
+	insertSealerTestEntries(t, store, integrity.MaxBatchEntries, 900, 0)
+	first, err := store.SealIntegrityBatch(ctx, false)
+	if err != nil || first == nil {
+		t.Fatalf("seal body-limited prefix: batch=%+v err=%v", first, err)
+	}
+	if first.Descriptor.LeafCount >= integrity.MaxBatchEntries || len(first.Manifest) > maxManifestBytes {
+		t.Fatalf("body limit did not split a bounded request: count=%d bytes=%d", first.Descriptor.LeafCount, len(first.Manifest))
+	}
+	second, err := store.SealIntegrityBatch(ctx, true)
+	if err != nil || second == nil {
+		t.Fatalf("seal remaining prefix: batch=%+v err=%v", second, err)
+	}
+	if second.Descriptor.BatchID != 2 || second.Descriptor.FirstSeq != first.Descriptor.LastSeq+1 || second.Descriptor.PrevBatchHash != first.BatchHash || second.Descriptor.LastSeq != integrity.MaxBatchEntries {
+		t.Fatalf("second batch broke continuity: first=%+v second=%+v", first.Descriptor, second.Descriptor)
+	}
+	var membershipCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_batch_entries`).Scan(&membershipCount); err != nil || membershipCount != integrity.MaxBatchEntries {
+		t.Fatalf("sealed prefix membership count=%d err=%v", membershipCount, err)
+	}
+}
+
+func TestIntegrityBatchSealerAgeFlushRollbackRestartAndCloseDrain(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	store.stopIntegritySealer()
+	insertSealerTestEntries(t, store, 2, 0, 6*time.Second)
+	batch, err := store.SealIntegrityBatch(ctx, false)
+	if err != nil || batch == nil || batch.Descriptor.LeafCount != 2 {
+		t.Fatalf("aged partial batch was not sealed: batch=%+v err=%v", batch, err)
+	}
+	insertSealerTestEntries(t, store, 2, 0, 0)
+	if pending, err := store.SealIntegrityBatch(ctx, false); err != nil || pending != nil {
+		t.Fatalf("young partial batch sealed too early: batch=%+v err=%v", pending, err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_batch_membership BEFORE INSERT ON integrity_batch_entries BEGIN SELECT RAISE(ABORT,'injected membership failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SealIntegrityBatch(ctx, true); err == nil {
+		t.Fatal("batch seal succeeded despite membership failure")
+	}
+	var batches, memberships, pendingQueue, lastSeq, nextBatch int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_batches`).Scan(&batches)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_batch_entries`).Scan(&memberships)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_witness_sync`).Scan(&pendingQueue)
+	_ = store.DB().QueryRow(`SELECT last_sealed_seq,next_batch_id FROM integrity_streams`).Scan(&lastSeq, &nextBatch)
+	if batches != 1 || memberships != 2 || pendingQueue != 1 || lastSeq != 2 || nextBatch != 2 {
+		t.Fatalf("failed seal left partial state: batches=%d memberships=%d queue=%d last=%d next=%d", batches, memberships, pendingQueue, lastSeq, nextBatch)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER fail_batch_membership`); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := store.SealIntegrityPending(ctx, 1); err != nil || count != 1 {
+		t.Fatalf("explicit bounded drain failed: count=%d err=%v", count, err)
+	}
+	path := store.dbPath
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var finalBatches, finalMembership int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM integrity_batches`).Scan(&finalBatches)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM integrity_batch_entries`).Scan(&finalMembership)
+	if finalBatches != 2 || finalMembership != 4 {
+		t.Fatalf("shutdown drain lost sealed state: batches=%d membership=%d", finalBatches, finalMembership)
+	}
+}
+
+func TestIntegrityBatchSealerWorkerFlushesAgedTail(t *testing.T) {
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	insertSealerTestEntries(t, store, 2, 0, 6*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var batches int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_batches`).Scan(&batches); err != nil {
+			t.Fatal(err)
+		}
+		if batches == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("background sealer did not flush the aged partial batch")
+}
+
+func TestIntegrityBatchSealerResumesAfterRestartAndCloseDrainsTail(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	store.stopIntegritySealer()
+	insertSealerTestEntries(t, store, 2, 0, 0)
+	path := store.dbPath
+	if err := store.auditDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := reopened.SealIntegrityBatch(ctx, true)
+	if err != nil || first == nil || first.Descriptor.LastSeq != 2 {
+		t.Fatalf("restart lost unsealed evidence: batch=%+v err=%v", first, err)
+	}
+	insertSealerTestEntries(t, reopened, 1, 0, 0)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var batches, entries int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM integrity_batches`).Scan(&batches); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM integrity_batch_entries`).Scan(&entries); err != nil {
+		t.Fatal(err)
+	}
+	if batches != 2 || entries != 3 {
+		t.Fatalf("close did not drain its bounded tail: batches=%d entries=%d", batches, entries)
+	}
+}
+
+func TestIntegrityEnableRejectsPopulatedStoreAndRawAppendIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("before-enable"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	var stream, epoch integrity.Hash
+	stream[0], epoch[0] = 1, 2
+	if err := store.EnableIntegrity(ctx, stream, epoch); err == nil {
+		t.Fatal("enabled evidence over existing rows")
+	}
+	if enabled, err := store.IntegrityEnabled(ctx); err != nil || enabled {
+		t.Fatalf("unexpected stream state enabled=%t err=%v", enabled, err)
+	}
+
+	store2 := setupTestStore(t)
+	enableTestIntegrity(t, store2)
+	rec := model.IngestedRecord{Transport: "file", SourceIP: "127.0.0.1", SourcePort: 514, RawBytes: []byte("exact raw bytes"), ReceivedAt: time.Now().UTC(), Metadata: model.ReceiveMetadata{FileID: "input-1", FileOffset: 9}}
+	first, err := store2.Store(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := store2.Store(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate.Duplicate {
+		t.Fatal("expected duplicate file coordinate")
+	}
+	entries, err := store2.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Kind != integrity.RawCommitted {
+		t.Fatalf("unexpected journal: %+v", entries)
+	}
+	decoded, err := integrity.DecodeEvidenceEntry(entries[0].EncodedEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Sequence != 1 || decoded.RawID == nil || *decoded.RawID != first.RawID || entries[0].LeafHash != integrity.MerkleLeaf(entries[0].EncodedEntry) {
+		t.Fatalf("raw evidence does not bind committed row: %+v", entries[0])
+	}
+	wantContentDigest := integrity.HashContent(rec.RawBytes)
+	if entries[0].ContentDigest != wantContentDigest {
+		t.Fatal("raw content digest does not match exact bytes")
+	}
+
+	if _, err := store2.DB().Exec(`CREATE TRIGGER fail_evidence BEFORE INSERT ON integrity_entries BEGIN SELECT RAISE(ABORT,'injected evidence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store2.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("must rollback"), ReceivedAt: time.Now().UTC()}); err == nil {
+		t.Fatal("raw commit succeeded without required evidence")
+	}
+	count, err := store2.CountRaw(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("raw write was not rolled back: count=%d err=%v", count, err)
+	}
+}
+
+func TestIntegrityAuditReaderIsBoundedReadOnlyAndReopens(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "audit.db")
+	store, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableTestIntegrity(t, store)
+	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("audit"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if store.auditDB == nil {
+		t.Fatal("integrity mode did not open a separate audit reader")
+	}
+	if _, err := store.auditDB.ExecContext(ctx, `UPDATE integrity_streams SET next_entry_seq=99`); err == nil {
+		t.Fatal("audit connection allowed a write")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Sequence != 1 {
+		t.Fatalf("audit reader did not read durable journal after reopen: %+v", entries)
+	}
+}
+
+func TestIntegrityFastAndDeepAuditPersistResultsAndDetectRawTamper(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	rec, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("audit payload"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SealIntegrityBatch(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, result, err := store.AuditIntegrity(ctx, false); err != nil || result != "passed" {
+		t.Fatalf("fast audit result=%q err=%v", result, err)
+	}
+	if _, result, err := store.AuditIntegrity(ctx, true); err != nil || result != "passed" {
+		t.Fatalf("deep audit result=%q err=%v", result, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE raw_events SET payload=? WHERE raw_id=?`, []byte("tampered"), rec.RawID); err != nil {
+		t.Fatal(err)
+	}
+	if _, result, err := store.AuditIntegrity(ctx, false); err != nil || result != "passed" {
+		t.Fatalf("fast audit should only establish saved digest consistency, got result=%q err=%v", result, err)
+	}
+	if _, result, err := store.AuditIntegrity(ctx, true); err != nil || result != "failed" {
+		t.Fatalf("deep audit did not catch raw tampering: result=%q err=%v", result, err)
+	}
+	var count int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM integrity_audit_runs`).Scan(&count); err != nil || count != 4 {
+		t.Fatalf("audit runs were not persisted: count=%d err=%v", count, err)
+	}
+}
+
+func TestIntegrityFastAuditDetectsSealedBatchMembershipTampering(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("sealed audit"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SealIntegrityBatch(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER integrity_membership_no_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE integrity_batch_entries SET leaf_hash=zeroblob(32) WHERE batch_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, result, err := store.AuditIntegrity(ctx, false); err != nil || result != "failed" {
+		t.Fatalf("fast audit accepted changed sealed membership: result=%q err=%v", result, err)
+	}
+}
+
+func TestIntegrityNormalizedVersionsAndRemoval(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("payload"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := integrityTestEvent(raw.RawID, raw.RawSHA256, 0, "first")
+	if err := store.StoreNormalized(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StoreNormalized(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	event.Raven.ParserFileSHA256[1] = 8
+	if err := store.StoreNormalized(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	event.OCSF["message"] = "second"
+	if err := store.StoreNormalized(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 || entries[1].Kind != integrity.NormalizedWritten || entries[2].Kind != integrity.NormalizedWritten || entries[3].Kind != integrity.NormalizedWritten {
+		t.Fatalf("identical retry or changed version journal incorrect: %+v", entries)
+	}
+	version, err := integrity.DecodeEvidenceEntry(entries[3].EncodedEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version.PreviousSubjectSeq == nil || *version.PreviousSubjectSeq != 3 {
+		t.Fatalf("normalized version missing previous evidence reference: %+v", version)
+	}
+	var persisted string
+	if err := store.DB().QueryRow(`SELECT event_json FROM normalized_events WHERE raw_id=?`, raw.RawID).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if string(entries[3].ContentSnapshot) != persisted || entries[3].ContentDigest != integrity.HashContent([]byte(persisted)) {
+		t.Fatal("evidence did not retain exact normalized JSON bytes")
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_norm_remove BEFORE INSERT ON integrity_entries WHEN NEW.entry_kind=6 BEGIN SELECT RAISE(ABORT,'injected removal failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteNormalizedChild(ctx, raw.RawID, 0); err == nil {
+		t.Fatal("normalized projection was removed without evidence")
+	}
+	var normalizedCount int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events WHERE raw_id=?`, raw.RawID).Scan(&normalizedCount); err != nil || normalizedCount != 1 {
+		t.Fatalf("normalized removal failure was not atomic: count=%d err=%v", normalizedCount, err)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER fail_norm_remove`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteNormalizedChild(ctx, raw.RawID, 0); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 5 || entries[4].Kind != integrity.NormalizedRemoved {
+		t.Fatalf("normalized removal transition missing: %+v", entries)
+	}
+}
+
+func TestIntegrityQuarantineSnapshotUpdateRemovalAndReplayResolution(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("bad input"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q1", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "invalid", RawPreview: "626164", CandidatePacks: []string{"z-pack", "a-pack"}, ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.QuarantineChild(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QuarantineChild(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	q.ErrorDetails = "bounded detail"
+	if err := store.QuarantineChild(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_quarantine_remove BEFORE INSERT ON integrity_entries WHEN NEW.entry_kind=7 BEGIN SELECT RAISE(ABORT,'injected removal failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteQuarantine(ctx, "q1"); err == nil {
+		t.Fatal("quarantine projection was removed without evidence")
+	}
+	if _, err := store.GetQuarantineByID(ctx, "q1"); err != nil {
+		t.Fatalf("failed quarantine removal was not rolled back: %v", err)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER fail_quarantine_remove`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteQuarantine(ctx, "q1"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 || entries[1].Kind != integrity.QuarantineWritten || entries[2].Kind != integrity.QuarantineWritten || entries[3].Kind != integrity.QuarantineRemoved {
+		t.Fatalf("quarantine journal transitions unexpected: %+v", entries)
+	}
+	var removed integrity.EvidenceEntry
+	if removed, err = integrity.DecodeEvidenceEntry(entries[3].EncodedEntry); err != nil || removed.PreviousSubjectSeq == nil || *removed.PreviousSubjectSeq != 3 {
+		t.Fatalf("quarantine removal lacks prior evidence ref: %+v err=%v", removed, err)
+	}
+
+	store2 := setupTestStore(t)
+	enableTestIntegrity(t, store2)
+	if _, err := store2.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("replay"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.NewOutbox(store2.DB()); err != nil {
+		t.Fatal(err)
+	}
+	raw2, err := store2.ListRawByStatus(ctx, model.StatusAccepted)
+	if err != nil || len(raw2) != 1 {
+		t.Fatalf("load raw: %v", err)
+	}
+	entry := model.QuarantineEntry{QuarantineID: "q-resolve", RawID: raw2[0].RawID, RawSHA256: raw2[0].RawSHA256, Stage: "decode", Reason: "retry", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store2.Quarantine(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	norm := integrityTestEvent(entry.RawID, entry.RawSHA256, 0, "resolved")
+	if err := store2.ResolveQuarantineWithOutbox(ctx, entry.QuarantineID, norm, []string{"sink"}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store2.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 4 || resolved[3].Kind != integrity.ReplayResolved || resolved[3].OperationID == "" {
+		t.Fatalf("replay resolution not committed with evidence: %+v", resolved)
+	}
+	var qCount, normCount, outboxCount, operationCount int
+	_ = store2.DB().QueryRow(`SELECT COUNT(*) FROM quarantine`).Scan(&qCount)
+	_ = store2.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normCount)
+	_ = store2.DB().QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&outboxCount)
+	_ = store2.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE state='completed'`).Scan(&operationCount)
+	if qCount != 0 || normCount != 1 || outboxCount != 1 || operationCount != 1 {
+		t.Fatalf("replay transaction incomplete q=%d normalized=%d outbox=%d operations=%d", qCount, normCount, outboxCount, operationCount)
+	}
+}
+
+func TestReplayOperationReturnsCommittedResultAndRejectsDifferentTarget(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	if _, err := outbox.NewOutbox(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("retry-safe replay"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-idempotent", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "retry", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.BeginReplay(ctx, q.QuarantineID, "stable-operation")
+	if err != nil || first.State != "running" {
+		t.Fatalf("claim replay: operation=%+v err=%v", first, err)
+	}
+	event := integrityTestEvent(raw.RawID, raw.RawSHA256, 0, "resolved once")
+	if err := store.ResolveQuarantineWithOutboxOperation(ctx, q.QuarantineID, event, []string{"sink"}, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	wantResult, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.BeginReplay(ctx, q.QuarantineID, first.ID)
+	if err != nil || retry.State != "completed" || !bytes.Equal(retry.ResultJSON, wantResult) {
+		t.Fatalf("retry did not return committed result: operation=%+v err=%v", retry, err)
+	}
+	if _, err := store.BeginReplay(ctx, "another-target", first.ID); !errors.Is(err, ErrReplayOperationConflict) {
+		t.Fatalf("same operation ID accepted another target: %v", err)
+	}
+	if _, err := store.BeginReplay(ctx, q.QuarantineID, "competing-operation"); !errors.Is(err, ErrReplayOperationConflict) {
+		t.Fatalf("second operation claimed an already-resolved target: %v", err)
+	}
+	var normalized, outboxCount, resolved, operations int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normalized)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&outboxCount)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_entries WHERE entry_kind=?`, integrity.ReplayResolved).Scan(&resolved)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE state='completed'`).Scan(&operations)
+	if normalized != 1 || outboxCount != 1 || resolved != 1 || operations != 1 {
+		t.Fatalf("replay retry duplicated side effects: normalized=%d outbox=%d resolved=%d operations=%d", normalized, outboxCount, resolved, operations)
+	}
+}
+
+func TestReplayFailureOperationIsNotRetried(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("failure replay"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-failed-retry", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "retry", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	op, err := store.BeginReplay(ctx, q.QuarantineID, "failed-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordReplayFailureWithOperation(ctx, op.Entry, errors.New("decode failed"), op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginReplay(ctx, q.QuarantineID, op.ID); !errors.Is(err, ErrReplayAlreadyFailed) {
+		t.Fatalf("failed operation was attempted again: %v", err)
+	}
+	var failures, failedOps int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_entries WHERE entry_kind=?`, integrity.ReplayFailed).Scan(&failures)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE state='failed'`).Scan(&failedOps)
+	if failures != 1 || failedOps != 1 {
+		t.Fatalf("failed retry duplicated evidence: replay_failed=%d failed_operations=%d", failures, failedOps)
+	}
+}
+
+func TestVerifyChecksCommittedRawMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "file", SourceIP: "127.0.0.1", SourcePort: 514, RawBytes: []byte("metadata-bound"), ReceivedAt: time.Now().UTC(), Metadata: model.ReceiveMetadata{FileID: "file-a", FileOffset: 12}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _, err := store.Verify(ctx, raw.RawID); err != nil || !ok {
+		t.Fatalf("untampered evidence failed verification: ok=%t err=%v", ok, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE raw_events SET source_ip='127.0.0.2' WHERE raw_id=?`, raw.RawID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _, err := store.Verify(ctx, raw.RawID); err != nil || ok {
+		t.Fatalf("metadata tampering was not detected: ok=%t err=%v", ok, err)
+	}
+}
+
+func TestIntegrityEvidenceFailureRollsBackNormalizedQuarantineAndOutbox(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("payload"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outbox.NewOutbox(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_evidence BEFORE INSERT ON integrity_entries BEGIN SELECT RAISE(ABORT,'injected evidence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	event := integrityTestEvent(raw.RawID, raw.RawSHA256, 0, "message")
+	if err := store.StoreNormalizedWithOutbox(ctx, event, []string{"sink"}); err == nil {
+		t.Fatal("normalized write succeeded without evidence")
+	}
+	var normalized, outboxCount int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normalized)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&outboxCount)
+	if normalized != 0 || outboxCount != 0 {
+		t.Fatalf("projection/outbox not rolled back: normalized=%d outbox=%d", normalized, outboxCount)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-rollback", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "failure", QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err == nil {
+		t.Fatal("quarantine write succeeded without evidence")
+	}
+	var quarantines int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM quarantine`).Scan(&quarantines)
+	if quarantines != 0 {
+		t.Fatalf("quarantine projection not rolled back: %d", quarantines)
+	}
+}
+
+func TestIntegrityReplayFailureIsJournaledAndResolutionRollsBackAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	enableTestIntegrity(t, store)
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("replay payload"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-fail", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "bad", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordReplayFailure(ctx, &q, errors.New("synthetic parser failure")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[2].Kind != integrity.ReplayFailed || entries[2].OperationID == "" {
+		t.Fatalf("replay failure was not recorded: %+v", entries)
+	}
+	var failedOperations int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM integrity_operations WHERE state='failed'`).Scan(&failedOperations); err != nil || failedOperations != 1 {
+		t.Fatalf("failed replay operation not recorded: count=%d err=%v", failedOperations, err)
+	}
+	if _, err := outbox.NewOutbox(store.DB()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_resolution BEFORE INSERT ON integrity_entries WHEN NEW.entry_kind=5 BEGIN SELECT RAISE(ABORT,'injected resolution failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	event := integrityTestEvent(raw.RawID, raw.RawSHA256, 0, "replayed")
+	if err := store.ResolveQuarantineWithOutbox(ctx, q.QuarantineID, event, []string{"sink"}); err == nil {
+		t.Fatal("replay resolution succeeded without resolution evidence")
+	}
+	var qCount, normCount, outboxCount int
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM quarantine`).Scan(&qCount)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM normalized_events`).Scan(&normCount)
+	_ = store.DB().QueryRow(`SELECT COUNT(*) FROM outbox`).Scan(&outboxCount)
+	if qCount != 1 || normCount != 0 || outboxCount != 0 {
+		t.Fatalf("failed replay resolution left partial data q=%d normalized=%d outbox=%d", qCount, normCount, outboxCount)
+	}
+}
+
+func TestSchemaV4MigrationRejectsDuplicateChildrenAndRollsBackDDL(t *testing.T) {
+	ctx := context.Background()
+	t.Run("additive migration preserves data", func(t *testing.T) {
+		store := setupTestStore(t)
+		raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("preserve"), ReceivedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`DROP TABLE integrity_findings; DROP TABLE integrity_audit_runs; DROP TABLE integrity_operations; DROP TABLE integrity_witness_sync; DROP TABLE integrity_batch_entries; DROP TABLE integrity_batches; DROP TABLE integrity_entries; DROP TABLE integrity_streams; PRAGMA user_version=4`); err != nil {
+			t.Fatal(err)
+		}
+		if err := initSchema(store.DB()); err != nil {
+			t.Fatalf("v4 to v6 migration: %v", err)
+		}
+		var version int
+		if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != CurrentSchemaVersion {
+			t.Fatalf("migrated user_version=%d err=%v", version, err)
+		}
+		if _, err := store.Retrieve(ctx, raw.RawID); err != nil {
+			t.Fatalf("migration lost preexisting raw data: %v", err)
+		}
+	})
+	t.Run("duplicate normalized child", func(t *testing.T) {
+		store := setupTestStore(t)
+		raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("x"), ReceivedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().Exec(`DROP INDEX idx_normalized_child; PRAGMA user_version=4`); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []string{"first", "second"} {
+			_, err := store.DB().Exec(`INSERT INTO normalized_events(event_id,raw_id,record_ordinal,source_category,source_id,event_time,received_time,event_json,event_sha256) VALUES(?,?,0,'test','test',0,'now','{}','')`, id, raw.RawID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := initSchema(store.DB()); err == nil {
+			t.Fatal("migration accepted duplicate child identities")
+		}
+		var version int
+		_ = store.DB().QueryRow(`PRAGMA user_version`).Scan(&version)
+		if version != 4 {
+			t.Fatalf("failed migration changed version to %d", version)
+		}
+	})
+	t.Run("partial DDL rollback", func(t *testing.T) {
+		store := setupTestStore(t)
+		if _, err := store.DB().Exec(`DROP INDEX idx_normalized_child; DROP TABLE integrity_findings; DROP TABLE integrity_audit_runs; DROP TABLE integrity_operations; DROP TABLE integrity_witness_sync; DROP TABLE integrity_batch_entries; DROP TABLE integrity_batches; DROP TABLE integrity_entries; DROP TABLE integrity_streams; PRAGMA user_version=4; CREATE VIEW integrity_streams AS SELECT 1 AS singleton`); err != nil {
+			t.Fatal(err)
+		}
+		if err := initSchema(store.DB()); err == nil {
+			t.Fatal("migration unexpectedly accepted conflicting schema object")
+		}
+		var version, indexCount int
+		_ = store.DB().QueryRow(`PRAGMA user_version`).Scan(&version)
+		_ = store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_normalized_child'`).Scan(&indexCount)
+		if version != 4 || indexCount != 0 {
+			t.Fatalf("migration did not roll back version/index: version=%d index=%d", version, indexCount)
+		}
+	})
+}
+
+func integrityTestEvent(rawID, rawHash string, ordinal int, message string) *model.NormalizedEvent {
+	var parserHash [32]byte
+	parserHash[0] = 9
+	return &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: "event-" + rawID, RawID: rawID, RawSHA256: rawHash, RecordOrdinal: ordinal, ParserPack: "test-pack", ParserVersion: "1.0.0", ParserFileSHA256: parserHash, CoreVersion: "test", SchemaVersion: "1.3.0", ReceivedTime: time.Now().UTC(), Status: "normalized"}, OCSF: map[string]any{"message": message, "time": int64(1)}}
 }
 
 func TestStoreAndRetrieveLossless(t *testing.T) {

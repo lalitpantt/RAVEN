@@ -2,11 +2,14 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"raven/internal/integrity"
 	"raven/internal/model"
 	"raven/internal/rawstore"
 )
@@ -34,6 +37,69 @@ func setupTestPipeline(t *testing.T, workers int) (*Pipeline, *rawstore.RawStore
 	})
 
 	return p, store, sink
+}
+
+func TestReplayFailureAppendsEvidenceOnlyWhenIntegrityEnabled(t *testing.T) {
+	p, store, _ := setupTestPipeline(t, 1)
+	ctx := context.Background()
+	var stream, epoch integrity.Hash
+	stream[0], epoch[0] = 3, 4
+	if err := store.EnableIntegrity(ctx, stream, epoch); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "test", RawBytes: []byte("original"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := model.QuarantineEntry{QuarantineID: "q-tampered", RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "decode", Reason: "test", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE raw_events SET payload=? WHERE raw_id=?`, []byte("tampered"), raw.RawID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Replay(ctx, q.QuarantineID); err == nil {
+		t.Fatal("tampered raw event unexpectedly replayed")
+	}
+	entries, err := store.ListIntegrityEntries(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[2].Kind != integrity.ReplayFailed {
+		t.Fatalf("replay failure evidence missing: %+v", entries)
+	}
+}
+
+func TestReplayRejectsIneligibleAndMissingStoredChildOrdinal(t *testing.T) {
+	p, store, _ := setupTestPipeline(t, 1)
+	ctx := context.Background()
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog", RawBytes: []byte("<14>1 2026-09-20T10:00:00Z host app - - sample"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ineligible := model.QuarantineEntry{QuarantineID: "q-ineligible-pipeline", RawID: raw.RawID, RawSHA256: raw.RawSHA256, RecordOrdinal: 0, Stage: "decode", Reason: "ineligible", ReplayEligible: false, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, ineligible); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.ReplayWithOperation(ctx, ineligible.QuarantineID, "ineligible-op"); !errors.Is(err, rawstore.ErrReplayIneligible) {
+		t.Fatalf("direct pipeline replay bypassed eligibility: %v", err)
+	}
+	if err := store.DeleteQuarantine(ctx, ineligible.QuarantineID); err != nil {
+		t.Fatal(err)
+	}
+	missingChild := model.QuarantineEntry{QuarantineID: "q-missing-child", RawID: raw.RawID, RawSHA256: raw.RawSHA256, RecordOrdinal: 7, Stage: "decode", Reason: "missing ordinal", ReplayEligible: true, QuarantinedAt: time.Now().UTC()}
+	if err := store.Quarantine(ctx, missingChild); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Replay(ctx, missingChild.QuarantineID); err == nil || !strings.Contains(err.Error(), "stored child ordinal 7 is missing") {
+		t.Fatalf("missing child ordinal replay did not fail exactly: %v", err)
+	}
+	if count, err := store.CountNormalized(ctx); err != nil || count != 0 {
+		t.Fatalf("missing child created a normalized projection: count=%d err=%v", count, err)
+	}
+	if _, err := store.GetQuarantineByID(ctx, missingChild.QuarantineID); err != nil {
+		t.Fatalf("missing child removed its quarantine sibling: %v", err)
+	}
 }
 
 func TestPipelineNormalFlowAndLossAccounting(t *testing.T) {

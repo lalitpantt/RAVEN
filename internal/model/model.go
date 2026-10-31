@@ -83,6 +83,7 @@ type DecodedRecord struct {
 // RavenEnvelope contains the mandatory provenance, cryptographic lineage, and schema metadata.
 type RavenEnvelope struct {
 	EventID           string           `json:"event_id"`           // unique event UUID e.g. "raven-evt-a1b2c3d4..."
+	ParserFileSHA256  [32]byte         `json:"-"`                  // exact parser pack bytes used for this normalization
 	RawID             string           `json:"raw_id"`             // pointer to parent raw store entry
 	RawSHA256         string           `json:"raw_sha256"`         // SHA-256 digest of original raw payload
 	RawBytes          int              `json:"raw_bytes"`          // byte length of raw payload

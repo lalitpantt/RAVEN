@@ -1,11 +1,25 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"testing"
 )
+
+func TestParseIntegrityHash(t *testing.T) {
+	input := "0x" + fmt.Sprintf("%064x", 42)
+	got, err := parseIntegrityHash(input)
+	if err != nil || hex.EncodeToString(got[:]) != fmt.Sprintf("%064x", 42) {
+		t.Fatalf("valid stream identity: got=%x err=%v", got, err)
+	}
+	for _, invalid := range []string{"", "0x01", "not-hex"} {
+		if _, err := parseIntegrityHash(invalid); err == nil {
+			t.Errorf("accepted invalid integrity identity %q", invalid)
+		}
+	}
+}
 
 func TestVersionFlags(t *testing.T) {
 	for _, arg := range []string{"-v", "--version"} {

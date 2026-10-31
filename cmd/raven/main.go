@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +24,7 @@ import (
 	"raven/internal/connections"
 	"raven/internal/decode"
 	"raven/internal/ingest"
+	"raven/internal/integrity"
 	"raven/internal/model"
 	"raven/internal/output"
 	"raven/internal/packs"
@@ -340,6 +344,12 @@ func main() {
 			}
 			cli.ListPacksCLI(":9090", pDir)
 			return
+		case "integrity":
+			code := cli.RunIntegrityCLI(os.Args[2:], ":9090", os.Getenv("RAVEN_ADMIN_TOKEN"), os.Stdout, os.Stderr)
+			if code != 0 {
+				os.Exit(code)
+			}
+			return
 		case "replay", "-replay", "--replay":
 			if len(os.Args) >= 3 {
 				target := os.Args[2]
@@ -359,6 +369,8 @@ func main() {
 	}
 
 	dbPath := flag.String("db", "data/raven.db", "Path to SQLite raw store database")
+	integrityStreamID := flag.String("integrity-stream-id", os.Getenv("RAVEN_STREAM_ID"), "Opt in to evidence integrity with a 32-byte hex stream ID")
+	integrityEpoch := flag.String("integrity-installation-epoch", os.Getenv("RAVEN_INSTALLATION_EPOCH"), "32-byte hex installation epoch for a new integrity stream")
 	packsDir := flag.String("packs-dir", "packs", "Path to YAML parser packs directory")
 	sourcesDir := flag.String("sources-dir", "sources", "Path to YAML Ingestion Source resources directory")
 	sinksDir := flag.String("sinks-dir", "sinks", "Path to YAML Delivery Sink resources directory")
@@ -442,6 +454,20 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	if *integrityStreamID != "" || *integrityEpoch != "" {
+		streamID, parseErr := parseIntegrityHash(*integrityStreamID)
+		if parseErr == nil {
+			var epoch integrity.Hash
+			epoch, parseErr = parseIntegrityHash(*integrityEpoch)
+			if parseErr == nil {
+				parseErr = store.EnableIntegrity(context.Background(), streamID, epoch)
+			}
+		}
+		if parseErr != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: enable integrity stream: %v\n", parseErr)
+			os.Exit(1)
+		}
+	}
 
 	// Verification mode
 	if *verifyRawID != "" {
@@ -568,6 +594,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store.StartIntegrityAudits(ctx)
+	if err := startConfiguredWitnessSync(ctx, store); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: witness synchronization configuration: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *syslogUDP != "" && *syslogUDP != "none" {
 		staticAdapters = append(staticAdapters, ingest.NewSyslogUDPListener(*syslogUDP))
@@ -655,6 +685,7 @@ func main() {
 			AdminToken: *adminToken,
 		}
 		uiServer = api.NewServer(*uiAddr, store, p, packManager, *packsDir, cfgInfo, web.Dist(), Version)
+		uiServer.SetIntegrityWitness(os.Getenv("RAVEN_WITNESS_URL"), os.Getenv("RAVEN_WITNESS_ADMIN_TOKEN"))
 		uiServer.SetMarketplaceOptions(*marketplaceOnline, *marketplaceURL)
 		uiServer.SetIngestTracker(mgr)
 		uiServer.SetConnManager(connMgr, *sinksDir)
@@ -819,4 +850,42 @@ func stripCommandOptions(args []string, stripJSON bool) []string {
 		}
 	}
 	return out
+}
+
+func parseIntegrityHash(value string) (integrity.Hash, error) {
+	var result integrity.Hash
+	value = strings.TrimPrefix(strings.TrimSpace(value), "0x")
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(result) {
+		return result, fmt.Errorf("identity must be exactly 32 bytes of hexadecimal")
+	}
+	copy(result[:], decoded)
+	return result, nil
+}
+
+func startConfiguredWitnessSync(ctx context.Context, store *rawstore.RawStore) error {
+	endpoint, token, adminToken, keyPath := os.Getenv("RAVEN_WITNESS_URL"), os.Getenv("RAVEN_WITNESS_TOKEN"), os.Getenv("RAVEN_WITNESS_ADMIN_TOKEN"), os.Getenv("RAVEN_WITNESS_PUBLIC_KEY")
+	configured := endpoint != "" || token != "" || adminToken != "" || keyPath != ""
+	if !configured {
+		return nil
+	}
+	if endpoint == "" || token == "" || adminToken == "" || keyPath == "" {
+		return fmt.Errorf("RAVEN_WITNESS_URL, RAVEN_WITNESS_TOKEN, RAVEN_WITNESS_ADMIN_TOKEN, and RAVEN_WITNESS_PUBLIC_KEY must be set together")
+	}
+	enabled, err := store.IntegrityEnabled(ctx)
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return fmt.Errorf("integrity stream is disabled; supply -integrity-stream-id and -integrity-installation-epoch on a fresh database")
+	}
+	encoded, err := os.ReadFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("read pinned witness public key: %w", err)
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return fmt.Errorf("pinned witness public key must be base64 Ed25519 bytes")
+	}
+	return store.StartWitnessSync(ctx, endpoint, token, adminToken, ed25519.PublicKey(key))
 }

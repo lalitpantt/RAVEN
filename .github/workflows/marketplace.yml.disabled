@@ -1,0 +1,69 @@
+name: Publish parser marketplace
+
+on:
+  push:
+    branches: [main]
+    paths: ["packs/*.yaml", "marketplace/metadata.json", "marketplace/releases/**", "cmd/marketplace/**", "internal/marketplace/**", "README.md", "MARKETPLACE.md", "CLI.md", "SECURITY.md", "BENCHMARKING.md", "assets/**", "scripts/build-release.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: marketplace-publish
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build embedded UI
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web
+      - name: Validate parser fixtures and pack YAML
+        run: |
+          go test ./...
+      - name: Build signed static marketplace
+        env:
+          RAVEN_MARKETPLACE_SIGNING_KEY: ${{ secrets.RAVEN_MARKETPLACE_SIGNING_KEY }}
+        run: go run ./cmd/marketplace -packs packs -metadata marketplace/metadata.json -out internal/marketplace/catalog-seed.json -site marketplace-site
+      - name: Add README homepage and its referenced files
+        run: |
+          { printf '%s\n' '---' '---' ''; cat README.md; } > marketplace-site/index.md
+          cp MARKETPLACE.md CLI.md SECURITY.md BENCHMARKING.md marketplace-site/
+          mkdir -p marketplace-site/assets marketplace-site/scripts
+          cp assets/raven-logo.png assets/raven-thumbnail-video.png marketplace-site/assets/
+          cp scripts/build-release.sh scripts/build-release.ps1 marketplace-site/scripts/
+      - name: Render README as the Pages homepage
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./marketplace-site
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./_site/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

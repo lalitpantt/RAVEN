@@ -111,6 +111,7 @@ func (n *Normalizer) Normalize(
 	// 8. Construct RAVEN envelope
 	envelope := model.RavenEnvelope{
 		EventID:           eventID,
+		ParserFileSHA256:  pack.SourceSHA256,
 		RawID:             raw.RawID,
 		RawSHA256:         raw.RawSHA256,
 		RawBytes:          raw.ByteCount,

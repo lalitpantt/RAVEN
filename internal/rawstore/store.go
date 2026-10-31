@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"raven/internal/integrity"
 	"raven/internal/model"
 
 	_ "modernc.org/sqlite"
@@ -21,9 +23,20 @@ import (
 
 // RawStore provides durable, cryptographically verified storage for raw byte streams.
 type RawStore struct {
-	db      *sql.DB
-	writeMu sync.Mutex
-	counter atomic.Uint64
+	db          *sql.DB
+	auditDB     *sql.DB
+	dbPath      string
+	writeMu     sync.Mutex
+	sealMu      sync.Mutex
+	sealCancel  context.CancelFunc
+	sealWG      sync.WaitGroup
+	witnessMu   sync.Mutex
+	witnessStop context.CancelFunc
+	witnessWG   sync.WaitGroup
+	auditMu     sync.Mutex
+	auditCancel context.CancelFunc
+	auditWG     sync.WaitGroup
+	counter     atomic.Uint64
 }
 
 // New opens an SQLite database, creates required tables and enables WAL mode.
@@ -54,12 +67,32 @@ func New(dbPath string) (*RawStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if _, err := db.Exec(`UPDATE integrity_audit_runs SET result='incomplete',completed_at=?,error_class='process_interrupted' WHERE completed_at IS NULL`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("recover interrupted integrity audits: %w", err)
+	}
 
-	return &RawStore{db: db}, nil
+	store := &RawStore{db: db, dbPath: dbPath}
+	enabled, err := store.IntegrityEnabled(context.Background())
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("read integrity stream state: %w", err)
+	}
+	if enabled && !strings.Contains(dbPath, ":memory:") {
+		store.auditDB, err = openReadOnlyDB(dbPath)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("open bounded integrity audit reader: %w", err)
+		}
+	}
+	if enabled {
+		store.startIntegritySealer()
+	}
+	return store, nil
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 7
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -77,6 +110,9 @@ func migrateSchema(db sqlExecutor) error {
 	var version int
 	if err := db.QueryRow("PRAGMA user_version;").Scan(&version); err != nil {
 		return fmt.Errorf("failed to read user_version: %w", err)
+	}
+	if version > CurrentSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
 
 	if version < 1 {
@@ -173,6 +209,173 @@ func migrateSchema(db sqlExecutor) error {
 		version = 4
 	}
 
+	if version < 5 {
+		var duplicateChildren int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM (
+			SELECT raw_id, record_ordinal FROM normalized_events
+			GROUP BY raw_id, record_ordinal HAVING COUNT(*) > 1
+		)`).Scan(&duplicateChildren); err != nil {
+			return fmt.Errorf("check duplicate normalized children before schema v5: %w", err)
+		}
+		if duplicateChildren != 0 {
+			return fmt.Errorf("cannot apply schema v5: found %d duplicate normalized child identities; resolve them explicitly before migration", duplicateChildren)
+		}
+		if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_normalized_child
+			ON normalized_events(raw_id, record_ordinal);
+
+			CREATE TABLE integrity_streams (
+				singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+				stream_id BLOB NOT NULL UNIQUE CHECK(length(stream_id)=32),
+				codec_version INTEGER NOT NULL CHECK(codec_version=1),
+				installation_epoch BLOB NOT NULL CHECK(length(installation_epoch)=32),
+				genesis_hash BLOB NOT NULL CHECK(length(genesis_hash)=32),
+				enabled INTEGER NOT NULL CHECK(enabled=1),
+				next_entry_seq INTEGER NOT NULL CHECK(next_entry_seq BETWEEN 1 AND 9223372036854775807),
+				next_batch_id INTEGER NOT NULL CHECK(next_batch_id BETWEEN 1 AND 9223372036854775807),
+				last_sealed_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_sealed_seq BETWEEN 0 AND 9223372036854775807),
+				last_batch_hash BLOB NOT NULL CHECK(length(last_batch_hash)=32)
+			);
+			CREATE TABLE integrity_entries (
+				stream_id BLOB NOT NULL CHECK(length(stream_id)=32),
+				entry_seq INTEGER NOT NULL CHECK(entry_seq BETWEEN 1 AND 9223372036854775807),
+				entry_kind INTEGER NOT NULL CHECK(entry_kind BETWEEN 1 AND 7),
+				subject_id TEXT,
+				raw_id TEXT,
+				child_ordinal INTEGER CHECK(child_ordinal BETWEEN 0 AND 2147483647),
+				operation_id TEXT,
+				previous_subject_seq INTEGER CHECK(previous_subject_seq BETWEEN 1 AND 9223372036854775807),
+				occurred_at_unix_ns INTEGER NOT NULL,
+				content_snapshot BLOB NOT NULL,
+				metadata_snapshot BLOB NOT NULL,
+				content_digest BLOB NOT NULL CHECK(length(content_digest)=32),
+				metadata_digest BLOB NOT NULL CHECK(length(metadata_digest)=32),
+				encoded_entry BLOB NOT NULL,
+				leaf_hash BLOB NOT NULL CHECK(length(leaf_hash)=32),
+				PRIMARY KEY(stream_id,entry_seq),
+				FOREIGN KEY(stream_id) REFERENCES integrity_streams(stream_id),
+				FOREIGN KEY(raw_id) REFERENCES raw_events(raw_id)
+			);
+			CREATE UNIQUE INDEX idx_integrity_new_raw ON integrity_entries(stream_id,raw_id) WHERE entry_kind=1 AND raw_id IS NOT NULL;
+			CREATE UNIQUE INDEX idx_integrity_operation_kind ON integrity_entries(stream_id,operation_id,entry_kind) WHERE operation_id IS NOT NULL;
+			CREATE INDEX idx_integrity_subject ON integrity_entries(stream_id,subject_id,entry_seq);
+			CREATE INDEX idx_integrity_raw ON integrity_entries(stream_id,raw_id,entry_seq);
+			CREATE TABLE integrity_batches (
+				stream_id BLOB NOT NULL CHECK(length(stream_id)=32),
+				batch_id INTEGER NOT NULL CHECK(batch_id BETWEEN 1 AND 9223372036854775807),
+				first_seq INTEGER NOT NULL CHECK(first_seq BETWEEN 1 AND 9223372036854775807),
+				last_seq INTEGER NOT NULL CHECK(last_seq BETWEEN first_seq AND 9223372036854775807),
+				leaf_count INTEGER NOT NULL CHECK(leaf_count BETWEEN 1 AND 5000 AND leaf_count=last_seq-first_seq+1),
+				merkle_root BLOB NOT NULL CHECK(length(merkle_root)=32),
+				prev_batch_hash BLOB NOT NULL CHECK(length(prev_batch_hash)=32),
+				batch_hash BLOB NOT NULL UNIQUE CHECK(length(batch_hash)=32),
+				encoded_descriptor BLOB NOT NULL CHECK(length(encoded_descriptor)=256),
+				sealed_at TEXT NOT NULL,
+				PRIMARY KEY(stream_id,batch_id),
+				FOREIGN KEY(stream_id) REFERENCES integrity_streams(stream_id)
+			);
+			CREATE TABLE integrity_batch_entries (
+				stream_id BLOB NOT NULL,
+				batch_id INTEGER NOT NULL,
+				leaf_index INTEGER NOT NULL CHECK(leaf_index BETWEEN 0 AND 4999),
+				entry_seq INTEGER NOT NULL,
+				leaf_hash BLOB NOT NULL CHECK(length(leaf_hash)=32),
+				PRIMARY KEY(stream_id,batch_id,leaf_index),
+				UNIQUE(stream_id,entry_seq),
+				FOREIGN KEY(stream_id,batch_id) REFERENCES integrity_batches(stream_id,batch_id),
+				FOREIGN KEY(stream_id,entry_seq) REFERENCES integrity_entries(stream_id,entry_seq)
+			);
+			CREATE TABLE integrity_witness_sync (
+				stream_id BLOB NOT NULL,
+				batch_id INTEGER NOT NULL,
+				retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count>=0),
+				next_retry_at TEXT,
+				state TEXT NOT NULL DEFAULT 'pending',
+				acknowledgement BLOB,
+				anchor_tx_hash BLOB CHECK(anchor_tx_hash IS NULL OR length(anchor_tx_hash)=32),
+				anchor_block_number INTEGER,
+				anchor_block_hash BLOB CHECK(anchor_block_hash IS NULL OR length(anchor_block_hash)=32),
+				last_error TEXT,
+				PRIMARY KEY(stream_id,batch_id),
+				FOREIGN KEY(stream_id,batch_id) REFERENCES integrity_batches(stream_id,batch_id)
+			);
+			CREATE TABLE integrity_operations (
+				operation_id TEXT PRIMARY KEY,
+				request_fingerprint BLOB NOT NULL CHECK(length(request_fingerprint)=32),
+				quarantine_id TEXT NOT NULL,
+				raw_id TEXT NOT NULL,
+				child_ordinal INTEGER NOT NULL CHECK(child_ordinal BETWEEN 0 AND 2147483647),
+				state TEXT NOT NULL CHECK(state IN ('running','completed','failed')),
+				normalized_entry_seq INTEGER,
+				result_summary TEXT,
+				error_class TEXT,
+				created_at TEXT NOT NULL,
+				completed_at TEXT
+			);
+			CREATE TABLE integrity_audit_runs (
+				run_id TEXT PRIMARY KEY,
+				run_type TEXT NOT NULL,
+				target_head INTEGER NOT NULL CHECK(target_head BETWEEN 0 AND 9223372036854775807),
+				target_hash BLOB CHECK(target_hash IS NULL OR length(target_hash)=32),
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				heartbeat_at TEXT,
+				cursor_seq INTEGER NOT NULL DEFAULT 0 CHECK(cursor_seq BETWEEN 0 AND 9223372036854775807),
+				checked_count INTEGER NOT NULL DEFAULT 0 CHECK(checked_count>=0),
+				result TEXT,
+				first_failed_seq INTEGER,
+				first_failed_batch INTEGER,
+				error_class TEXT
+			);
+			CREATE TABLE integrity_findings (
+				finding_id INTEGER PRIMARY KEY,
+				run_id TEXT NOT NULL,
+				detected_at TEXT NOT NULL,
+				subject_id TEXT,
+				batch_id INTEGER,
+				entry_seq INTEGER,
+				expected_hash BLOB CHECK(expected_hash IS NULL OR length(expected_hash)=32),
+				actual_hash BLOB CHECK(actual_hash IS NULL OR length(actual_hash)=32),
+				classification TEXT NOT NULL,
+				details TEXT NOT NULL DEFAULT '',
+				first_seen_at TEXT NOT NULL,
+				last_seen_at TEXT NOT NULL,
+				occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK(occurrence_count>0),
+				FOREIGN KEY(run_id) REFERENCES integrity_audit_runs(run_id)
+			);
+			CREATE TRIGGER integrity_entries_no_update BEFORE UPDATE ON integrity_entries BEGIN SELECT RAISE(ABORT,'integrity entries are immutable'); END;
+			CREATE TRIGGER integrity_entries_no_delete BEFORE DELETE ON integrity_entries BEGIN SELECT RAISE(ABORT,'integrity entries are immutable'); END;
+			CREATE TRIGGER integrity_batches_no_update BEFORE UPDATE ON integrity_batches BEGIN SELECT RAISE(ABORT,'integrity batches are immutable'); END;
+			CREATE TRIGGER integrity_batches_no_delete BEFORE DELETE ON integrity_batches BEGIN SELECT RAISE(ABORT,'integrity batches are immutable'); END;
+			CREATE TRIGGER integrity_stream_identity_no_update BEFORE UPDATE OF stream_id,codec_version,installation_epoch,genesis_hash,enabled ON integrity_streams BEGIN SELECT RAISE(ABORT,'integrity stream identity is immutable'); END;
+			CREATE TRIGGER integrity_stream_no_delete BEFORE DELETE ON integrity_streams BEGIN SELECT RAISE(ABORT,'integrity stream cannot be deleted'); END;
+			CREATE TRIGGER integrity_membership_no_update BEFORE UPDATE ON integrity_batch_entries BEGIN SELECT RAISE(ABORT,'sealed batch membership is immutable'); END;
+			CREATE TRIGGER integrity_membership_no_delete BEFORE DELETE ON integrity_batch_entries BEGIN SELECT RAISE(ABORT,'sealed batch membership is immutable'); END;
+			`); err != nil {
+			return fmt.Errorf("failed to create integrity schema v5: %w", err)
+		}
+		version = 5
+	}
+
+	if version < 6 {
+		if _, err := db.Exec(`ALTER TABLE integrity_entries ADD COLUMN committed_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'`); err != nil {
+			return fmt.Errorf("failed to add evidence commit timestamps for schema v6: %w", err)
+		}
+		version = 6
+	}
+
+	if version < 7 {
+		if _, err := db.Exec(`ALTER TABLE integrity_streams ADD COLUMN enabled_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'`); err != nil {
+			return fmt.Errorf("failed to add integrity enable time for schema v7: %w", err)
+		}
+		if _, err := db.Exec(`UPDATE integrity_streams SET enabled_at=?`, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return fmt.Errorf("backfill integrity enable time for schema v7: %w", err)
+		}
+		if _, err := db.Exec(`DROP TRIGGER integrity_stream_identity_no_update; CREATE TRIGGER integrity_stream_identity_no_update BEFORE UPDATE OF stream_id,codec_version,installation_epoch,genesis_hash,enabled,enabled_at ON integrity_streams BEGIN SELECT RAISE(ABORT,'integrity stream identity is immutable'); END;`); err != nil {
+			return fmt.Errorf("protect integrity enable time in schema v7: %w", err)
+		}
+		version = 7
+	}
+
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {
 		return fmt.Errorf("failed to set user_version: %w", err)
 	}
@@ -244,7 +447,12 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 	INSERT INTO raw_events (raw_id, raw_sha256, byte_count, transport, source_ip, source_port, metadata_json, received_at, payload, status)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
-	_, err = s.db.ExecContext(ctx, query,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin raw commit transaction: %w", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, query,
 		event.RawID,
 		event.RawSHA256,
 		event.ByteCount,
@@ -258,6 +466,26 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to persist raw record %s: %w", rawID, err)
+	}
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if enabled {
+		metadataFields, err := rawMetadataFields(event)
+		if err != nil {
+			return nil, err
+		}
+		id := event.RawID
+		if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{
+			kind: integrity.RawCommitted, subjectID: &id, rawID: &id, occurredAt: event.ReceivedAt,
+			contentSnapshot: []byte{}, contentBytes: event.Payload, metadataFields: metadataFields,
+		}); err != nil {
+			return nil, fmt.Errorf("failed to append raw commit evidence: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit raw record %s: %w", rawID, err)
 	}
 
 	return event, nil
@@ -318,7 +546,37 @@ func (s *RawStore) Verify(ctx context.Context, rawID string) (bool, string, erro
 	computed := sha256.Sum256(evt.Payload)
 	computedHex := hex.EncodeToString(computed[:])
 
-	matches := (computedHex == evt.RawSHA256)
+	matches := computedHex == evt.RawSHA256 && evt.ByteCount == len(evt.Payload)
+	enabled, err := s.IntegrityEnabled(ctx)
+	if err != nil {
+		return false, computedHex, err
+	}
+	if enabled {
+		fields, err := rawMetadataFields(evt)
+		if err != nil {
+			return false, computedHex, err
+		}
+		metadata, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return false, computedHex, err
+		}
+		var subject string
+		var occurredAt int64
+		var streamID, contentSnapshot, metadataSnapshot, contentDigest, metadataDigest, encoded, leaf []byte
+		var sequence uint64
+		err = s.db.QueryRowContext(ctx, `SELECT stream_id,entry_seq,subject_id,occurred_at_unix_ns,content_snapshot,metadata_snapshot,content_digest,metadata_digest,encoded_entry,leaf_hash FROM integrity_entries WHERE stream_id=(SELECT stream_id FROM integrity_streams WHERE singleton=1) AND entry_kind=? AND raw_id=? ORDER BY entry_seq LIMIT 1`, integrity.RawCommitted, rawID).Scan(&streamID, &sequence, &subject, &occurredAt, &contentSnapshot, &metadataSnapshot, &contentDigest, &metadataDigest, &encoded, &leaf)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, computedHex, nil
+			}
+			return false, computedHex, err
+		}
+		contentHash := integrity.HashContent(evt.Payload)
+		metadataHash := integrity.HashContent(metadata)
+		decoded, decodeErr := integrity.DecodeEvidenceEntry(encoded)
+		leafHash := integrity.MerkleLeaf(encoded)
+		matches = matches && decodeErr == nil && decoded.Kind == integrity.RawCommitted && decoded.Sequence == sequence && equalBytes(decoded.StreamID[:], streamID) && decoded.SubjectID != nil && *decoded.SubjectID == rawID && decoded.RawID != nil && *decoded.RawID == rawID && decoded.ChildOrdinal == nil && decoded.OperationID == nil && subject == rawID && occurredAt == evt.ReceivedAt.UTC().UnixNano() && len(contentSnapshot) == 0 && equalBytes(metadataSnapshot, metadata) && equalBytes(contentDigest, contentHash[:]) && equalBytes(metadataDigest, metadataHash[:]) && decoded.ContentDigest == contentHash && decoded.MetadataDigest == metadataHash && equalBytes(leaf, leafHash[:])
+	}
 	return matches, computedHex, nil
 }
 
@@ -351,6 +609,10 @@ func (s *RawStore) quarantine(ctx context.Context, entry model.QuarantineEntry, 
 		return fmt.Errorf("failed to begin quarantine tx: %w", err)
 	}
 	defer tx.Rollback()
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 
 	replayVal := 0
 	if entry.ReplayEligible {
@@ -382,6 +644,47 @@ func (s *RawStore) quarantine(ctx context.Context, entry model.QuarantineEntry, 
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert quarantine entry: %w", err)
+	}
+	if enabled {
+		var persistedID string
+		if err := tx.QueryRowContext(ctx, `SELECT quarantine_id FROM quarantine WHERE raw_id=? AND record_ordinal=? AND stage=? AND reason=?`, entry.RawID, entry.RecordOrdinal, entry.Stage, entry.Reason).Scan(&persistedID); err != nil {
+			return err
+		}
+		persisted, err := loadQuarantineTx(ctx, tx, persistedID)
+		if err != nil {
+			return err
+		}
+		fields, err := quarantineEvidenceFields(persisted)
+		if err != nil {
+			return err
+		}
+		snapshot, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return err
+		}
+		previous, err := latestEntrySeqTx(ctx, tx, integrity.QuarantineWritten, persisted.RawID, persisted.RecordOrdinal, persisted.QuarantineID)
+		if err != nil {
+			return err
+		}
+		changed := true
+		if previous != 0 {
+			var last []byte
+			if err := tx.QueryRowContext(ctx, `SELECT content_snapshot FROM integrity_entries WHERE stream_id=(SELECT stream_id FROM integrity_streams WHERE singleton=1) AND entry_seq=?`, previous).Scan(&last); err != nil {
+				return err
+			}
+			changed = !equalBytes(last, snapshot)
+		}
+		if changed {
+			id, rawID := persisted.QuarantineID, persisted.RawID
+			ordinal := uint32(persisted.RecordOrdinal)
+			var prev *uint64
+			if previous > 0 {
+				prev = &previous
+			}
+			if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.QuarantineWritten, subjectID: &id, rawID: &rawID, childOrdinal: &ordinal, previousSubjectSeq: prev, occurredAt: persisted.QuarantinedAt, contentSnapshot: snapshot, contentFields: fields}); err != nil {
+				return fmt.Errorf("append quarantine evidence: %w", err)
+			}
+		}
 	}
 	if finalize {
 		if _, err := tx.ExecContext(ctx, `UPDATE raw_events SET status = ? WHERE raw_id = ?`, string(model.StatusQuarantined), entry.RawID); err != nil {
@@ -520,10 +823,36 @@ func (s *RawStore) GetQuarantineByID(ctx context.Context, qID string) (*model.Qu
 func (s *RawStore) MarkReplayed(ctx context.Context, qID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var entry *model.QuarantineEntry
+	var previous uint64
+	if enabled {
+		entry, err = loadQuarantineTx(ctx, tx, qID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("quarantine entry not found for replay update: %s", qID)
+			}
+			return err
+		}
+		previous, err = latestEntrySeqTx(ctx, tx, integrity.QuarantineWritten, entry.RawID, entry.RecordOrdinal, entry.QuarantineID)
+		if err != nil {
+			return err
+		}
+		if previous == 0 {
+			return errors.New("quarantine entry has no integrity evidence")
+		}
+	}
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	query := `UPDATE quarantine SET replayed_at = ? WHERE quarantine_id = ?;`
-	res, err := s.db.ExecContext(ctx, query, nowStr, qID)
+	res, err := tx.ExecContext(ctx, query, nowStr, qID)
 	if err != nil {
 		return fmt.Errorf("failed to mark quarantine %s as replayed: %w", qID, err)
 	}
@@ -531,7 +860,27 @@ func (s *RawStore) MarkReplayed(ctx context.Context, qID string) error {
 	if n == 0 {
 		return fmt.Errorf("quarantine entry not found for replay update: %s", qID)
 	}
-	return nil
+	if enabled {
+		updated, err := loadQuarantineTx(ctx, tx, qID)
+		if err != nil {
+			return err
+		}
+		fields, err := quarantineEvidenceFields(updated)
+		if err != nil {
+			return err
+		}
+		snapshot, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return err
+		}
+		id, rawID := updated.QuarantineID, updated.RawID
+		ordinal := uint32(updated.RecordOrdinal)
+		prev := previous
+		if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.QuarantineWritten, subjectID: &id, rawID: &rawID, childOrdinal: &ordinal, previousSubjectSeq: &prev, occurredAt: time.Now().UTC(), contentSnapshot: snapshot, contentFields: fields}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // GetReplayPendingIDs returns quarantine IDs eligible for reprocessing.
@@ -566,10 +915,57 @@ func (s *RawStore) GetReplayPendingIDs(ctx context.Context, includeAlreadyReplay
 func (s *RawStore) DeleteQuarantine(ctx context.Context, qID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-
-	query := `DELETE FROM quarantine WHERE quarantine_id = ?;`
-	_, err := s.db.ExecContext(ctx, query, qID)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var entry *model.QuarantineEntry
+	var previous uint64
+	if enabled {
+		entry, err = loadQuarantineTx(ctx, tx, qID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return tx.Commit()
+		}
+		if err != nil {
+			return err
+		}
+		previous, err = latestEntrySeqTx(ctx, tx, integrity.QuarantineWritten, entry.RawID, entry.RecordOrdinal, entry.QuarantineID)
+		if err != nil {
+			return err
+		}
+		if previous == 0 {
+			return errors.New("quarantine entry has no integrity evidence")
+		}
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM quarantine WHERE quarantine_id=?`, qID)
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return tx.Commit()
+	}
+	if enabled {
+		if entry.RecordOrdinal < 0 || int64(entry.RecordOrdinal) > math.MaxInt32 {
+			return errors.New("quarantine child ordinal is outside the evidence codec range")
+		}
+		fields := []integrity.TypedField{fieldU64(1, previous), fieldText(2, "projection_removed")}
+		snapshot, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return err
+		}
+		id, rawID := entry.QuarantineID, entry.RawID
+		ordinal := uint32(entry.RecordOrdinal)
+		prev := previous
+		if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.QuarantineRemoved, subjectID: &id, rawID: &rawID, childOrdinal: &ordinal, previousSubjectSeq: &prev, occurredAt: time.Now().UTC(), contentSnapshot: snapshot, contentFields: fields}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // CountRaw returns the total number of raw events in storage.
@@ -607,8 +1003,53 @@ func (s *RawStore) StoreNormalized(ctx context.Context, event *model.NormalizedE
 func (s *RawStore) DeleteNormalizedChild(ctx context.Context, rawID string, ordinal int) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.ExecContext(ctx, "DELETE FROM normalized_events WHERE raw_id=? AND record_ordinal=?", rawID, ordinal)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var eventID string
+	err = tx.QueryRowContext(ctx, `SELECT event_id FROM normalized_events WHERE raw_id=? AND record_ordinal=?`, rawID, ordinal).Scan(&eventID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	}
+	if err != nil {
+		return err
+	}
+	if enabled {
+		previous, err := latestEntrySeqTx(ctx, tx, integrity.NormalizedWritten, rawID, ordinal, eventID)
+		if err != nil {
+			return err
+		}
+		if previous == 0 {
+			return errors.New("normalized child has no integrity evidence")
+		}
+		if ordinal < 0 || int64(ordinal) > math.MaxInt32 {
+			return errors.New("normalized child ordinal is outside the evidence codec range")
+		}
+		fields := []integrity.TypedField{fieldU64(1, previous), fieldText(2, "projection_removed")}
+		snapshot, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return err
+		}
+		seq := previous
+		child := uint32(ordinal)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM normalized_events WHERE raw_id=? AND record_ordinal=?`, rawID, ordinal); err != nil {
+			return err
+		}
+		if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.NormalizedRemoved, subjectID: &eventID, rawID: &rawID, childOrdinal: &child, previousSubjectSeq: &seq, occurredAt: time.Now().UTC(), contentSnapshot: snapshot, contentFields: fields}); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM normalized_events WHERE raw_id=? AND record_ordinal=?", rawID, ordinal); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // StoreNormalizedWithOutbox atomically stores the projection and one idempotent delivery row per destination.
@@ -628,6 +1069,21 @@ func (s *RawStore) StoreNormalizedWithOutbox(ctx context.Context, event *model.N
 
 // ResolveQuarantineWithOutbox atomically replaces one quarantined child and updates its parent outcome.
 func (s *RawStore) ResolveQuarantineWithOutbox(ctx context.Context, qID string, event *model.NormalizedEvent, destinations []string) error {
+	opID, err := newOperationID()
+	if err != nil {
+		return err
+	}
+	op, err := s.BeginReplay(ctx, qID, opID)
+	if err != nil {
+		return err
+	}
+	if op.State == "completed" {
+		return nil
+	}
+	return s.ResolveQuarantineWithOutboxOperation(ctx, qID, event, destinations, opID)
+}
+
+func (s *RawStore) ResolveQuarantineWithOutboxOperation(ctx context.Context, qID string, event *model.NormalizedEvent, destinations []string, opID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -635,8 +1091,67 @@ func (s *RawStore) ResolveQuarantineWithOutbox(ctx context.Context, qID string, 
 		return err
 	}
 	defer tx.Rollback()
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	q, err := loadQuarantineTx(ctx, tx, qID)
+	if err != nil {
+		return fmt.Errorf("load quarantine for resolution: %w", err)
+	}
+	if !q.ReplayEligible {
+		return ErrReplayIneligible
+	}
+	if q.RawID != event.Raven.RawID || q.RecordOrdinal != event.Raven.RecordOrdinal {
+		return errors.New("quarantine identity does not match normalized child")
+	}
+	var quarantineSeq uint64
+	if enabled {
+		quarantineSeq, err = latestEntrySeqTx(ctx, tx, integrity.QuarantineWritten, q.RawID, q.RecordOrdinal, q.QuarantineID)
+		if err != nil {
+			return err
+		}
+		if quarantineSeq == 0 {
+			return errors.New("quarantine entry has no integrity evidence")
+		}
+	}
 	if err := storeNormalizedTx(ctx, tx, event, destinations); err != nil {
 		return err
+	}
+	var normalizedSeq any
+	if enabled {
+		seq, err := latestEntrySeqTx(ctx, tx, integrity.NormalizedWritten, event.Raven.RawID, event.Raven.RecordOrdinal, event.Raven.EventID)
+		if err != nil {
+			return err
+		}
+		if seq == 0 {
+			return errors.New("normalized child has no integrity evidence")
+		}
+		normalizedSeq = seq
+		content := []integrity.TypedField{fieldU64(1, quarantineSeq), fieldU64(2, seq)}
+		snapshot, err := integrity.EncodeFields(content)
+		if err != nil {
+			return err
+		}
+		ordinal := uint32(q.RecordOrdinal)
+		subject, rawID := q.QuarantineID, q.RawID
+		previous := quarantineSeq
+		metadata := []integrity.TypedField{fieldBytes32(1, event.Raven.ParserFileSHA256)}
+		if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.ReplayResolved, subjectID: &subject, rawID: &rawID, childOrdinal: &ordinal, operationID: &opID, previousSubjectSeq: &previous, occurredAt: time.Now().UTC(), contentSnapshot: snapshot, contentFields: content, metadataFields: metadata}); err != nil {
+			return fmt.Errorf("append replay resolution evidence: %w", err)
+		}
+	}
+	resultJSON, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal replay result: %w", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	completed, err := tx.ExecContext(ctx, `UPDATE integrity_operations SET state='completed',normalized_entry_seq=?,result_summary=?,completed_at=? WHERE operation_id=? AND state='running' AND quarantine_id=? AND raw_id=? AND child_ordinal=?`, normalizedSeq, string(resultJSON), now, opID, q.QuarantineID, q.RawID, q.RecordOrdinal)
+	if err != nil {
+		return fmt.Errorf("complete replay operation: %w", err)
+	}
+	if n, _ := completed.RowsAffected(); n != 1 {
+		return errors.New("replay operation is missing or no longer running")
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM quarantine WHERE quarantine_id=? AND raw_id=? AND record_ordinal=?`, qID, event.Raven.RawID, event.Raven.RecordOrdinal)
 	if err != nil {
@@ -687,15 +1202,60 @@ func storeNormalizedTx(ctx context.Context, tx *sql.Tx, event *model.NormalizedE
 	if v, ok := event.OCSF["message"].(string); ok {
 		msg = v
 	}
-	var existing string
-	if err = tx.QueryRowContext(ctx, "SELECT event_id FROM normalized_events WHERE raw_id=? AND record_ordinal=? LIMIT 1", event.Raven.RawID, event.Raven.RecordOrdinal).Scan(&existing); err == nil && existing != "" {
-		event.Raven.EventID = existing
-		data, _ = json.Marshal(event)
+	var existingID, existingJSON string
+	existingErr := tx.QueryRowContext(ctx, "SELECT event_id,event_json FROM normalized_events WHERE raw_id=? AND record_ordinal=? LIMIT 1", event.Raven.RawID, event.Raven.RecordOrdinal).Scan(&existingID, &existingJSON)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return fmt.Errorf("read normalized child projection: %w", existingErr)
 	}
+	if existingErr == nil && existingID != "" {
+		event.Raven.EventID = existingID
+		data, err = json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("marshal normalized event with committed ID: %w", err)
+		}
+	}
+	changed := existingErr != nil || existingJSON != string(data)
 	sum := sha256.Sum256(data)
 	_, err = tx.ExecContext(ctx, `INSERT INTO normalized_events(event_id,raw_id,record_ordinal,source_category,source_id,severity_id,activity_name,message,event_time,received_time,event_json,event_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET source_category=excluded.source_category,source_id=excluded.source_id,severity_id=excluded.severity_id,activity_name=excluded.activity_name,message=excluded.message,event_time=excluded.event_time,received_time=excluded.received_time,event_json=excluded.event_json,event_sha256=excluded.event_sha256`, event.Raven.EventID, event.Raven.RawID, event.Raven.RecordOrdinal, event.Raven.SourceCategory, event.Raven.SourceID, severity, activity, msg, eventTime, event.Raven.ReceivedTime.Format(time.RFC3339Nano), string(data), hex.EncodeToString(sum[:]))
 	if err != nil {
 		return err
+	}
+	enabled, err := integrityEnabledTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if enabled {
+		if event.Raven.RecordOrdinal < 0 || int64(event.Raven.RecordOrdinal) > math.MaxInt32 {
+			return errors.New("normalized child ordinal is outside the evidence codec range")
+		}
+		fields := normalizedMetadataFields(event)
+		metadataSnapshot, err := integrity.EncodeFields(fields)
+		if err != nil {
+			return err
+		}
+		id, rawID := event.Raven.EventID, event.Raven.RawID
+		ordinal := uint32(event.Raven.RecordOrdinal)
+		previous, err := latestEntrySeqTx(ctx, tx, integrity.NormalizedWritten, rawID, event.Raven.RecordOrdinal, id)
+		if err != nil {
+			return err
+		}
+		evidenceChanged := changed
+		if previous > 0 {
+			var lastContent, lastMetadata []byte
+			if err := tx.QueryRowContext(ctx, `SELECT content_snapshot,metadata_snapshot FROM integrity_entries WHERE stream_id=(SELECT stream_id FROM integrity_streams WHERE singleton=1) AND entry_seq=?`, previous).Scan(&lastContent, &lastMetadata); err != nil {
+				return err
+			}
+			evidenceChanged = !equalBytes(lastContent, data) || !equalBytes(lastMetadata, metadataSnapshot)
+		}
+		var prev *uint64
+		if previous > 0 {
+			prev = &previous
+		}
+		if evidenceChanged {
+			if _, err := appendEvidenceTx(ctx, tx, evidenceWrite{kind: integrity.NormalizedWritten, subjectID: &id, rawID: &rawID, childOrdinal: &ordinal, previousSubjectSeq: prev, occurredAt: time.Now().UTC(), contentSnapshot: data, metadataFields: fields}); err != nil {
+				return fmt.Errorf("append normalized evidence: %w", err)
+			}
+		}
 	}
 	now := time.Now().UTC()
 	for _, dest := range destinations {
@@ -1072,5 +1632,20 @@ func (s *RawStore) Ping(ctx context.Context) error {
 
 // Close closes the underlying SQLite database handle.
 func (s *RawStore) Close() error {
-	return s.db.Close()
+	s.stopIntegrityAudits()
+	s.witnessMu.Lock()
+	if s.witnessStop != nil {
+		s.witnessStop()
+	}
+	s.witnessMu.Unlock()
+	s.witnessWG.Wait()
+	s.stopIntegritySealer()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, sealErr := s.SealIntegrityPending(ctx, shutdownBatches)
+	cancel()
+	var auditErr error
+	if s.auditDB != nil {
+		auditErr = s.auditDB.Close()
+	}
+	return errors.Join(sealErr, auditErr, s.db.Close())
 }

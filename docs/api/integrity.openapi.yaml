@@ -1,0 +1,707 @@
+openapi: 3.1.0
+info:
+  title: RAVEN Integrity and Witness API
+  version: 1.0.0-draft
+  description: >-
+    Operator API for local evidence integrity, witness audits, and proofs.
+    Witness-admin forwarding uses a credential separate from the producer token.
+servers:
+  - url: http://127.0.0.1:9090
+    description: Native RAVEN management listener (loopback development default)
+tags:
+  - name: RAVEN integrity
+  - name: Witness producer
+  - name: Witness admin
+paths:
+  /api/v1/integrity/status:
+    get:
+      tags: [RAVEN integrity]
+      operationId: getIntegrityStatus
+      summary: Read local evidence and anchor status
+      description: >-
+        Returns enabled or disabled status without exposing credentials or key
+        material. A disabled feature and a never-run audit are not successful
+        proof results.
+      security:
+        - RavenAdminKey: []
+        - RavenAdminBearer: []
+      responses:
+        '200':
+          description: Current status; disabled is a valid status response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrityStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminAuthNotConfigured'
+
+  /api/v1/integrity/audits:
+    post:
+      tags: [RAVEN integrity]
+      operationId: startIntegrityAudit
+      summary: Request an asynchronous integrity audit
+      description: >-
+        Starts at most one active audit of each type. An identical request
+        while that audit is active returns its existing run ID. Ledger audits
+        are submitted to the witness; no request resets checkpoints or trust.
+      security:
+        - RavenAdminKey: []
+        - RavenAdminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditRequest'
+            examples:
+              fast:
+                value: {type: fast}
+              ledger:
+                value: {type: ledger}
+      responses:
+        '202':
+          description: Audit accepted or matching active audit returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminAuthNotConfigured'
+        '409':
+          description: Integrity mode is disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                disabled:
+                  value: {error: integrity mode is disabled}
+        '503':
+          description: Required witness or durable storage is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/integrity/audits/{run_id}:
+    parameters:
+      - $ref: '#/components/parameters/RunID'
+    get:
+      tags: [RAVEN integrity]
+      operationId: getIntegrityAudit
+      summary: Read audit progress or result
+      security:
+        - RavenAdminKey: []
+        - RavenAdminBearer: []
+      responses:
+        '200':
+          description: Bounded audit status and captured target.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminAuthNotConfigured'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/integrity/proofs/{entry_seq}:
+    parameters:
+      - name: entry_seq
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+    get:
+      tags: [RAVEN integrity]
+      operationId: getIntegrityProof
+      summary: Read an evidence inclusion proof and its trust state
+      description: >-
+        A known entry whose batch is still pending returns 200 with proof_state
+        pending; unavailable trust services are reported explicitly. This is
+        not equivalent to confirmed proof.
+      security:
+        - RavenAdminKey: []
+        - RavenAdminBearer: []
+      responses:
+        '200':
+          description: Proof or an explicit pending/unavailable state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProofResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminAuthNotConfigured'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/streams/{stream_id}/batches:
+    servers:
+      - url: http://127.0.0.1:9091
+        description: Native witness listener (loopback development default)
+      - url: http://witness:9091
+        description: Witness service name on the isolated Compose network
+    parameters:
+      - $ref: '#/components/parameters/StreamID'
+    post:
+      tags: [Witness producer]
+      operationId: retainEvidenceBatch
+      summary: Validate, durably retain, and queue one evidence batch
+      description: >-
+        The serialized request body is limited to 4 MiB. The witness verifies
+        stream identity, exact membership, contiguous sequence, entry Merkle
+        root, and descriptor hash before committing the manifest and queue.
+        It acknowledges only after that commit. Identical resubmission is
+        idempotent; different content at the same batch identity is equivocation.
+      security:
+        - WitnessProducerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchManifest'
+            examples:
+              oneEntry:
+                summary: Single entry manifest shape
+                value:
+                  descriptor:
+                    codec_version: 1
+                    stream_id: '0x1111111111111111111111111111111111111111111111111111111111111111'
+                    batch_id: 1
+                    first_seq: 1
+                    last_seq: 1
+                    leaf_count: 1
+                    merkle_root: '0xfb78c154747e7597380562a44bb74589a6d37a52130b4dd7b648366a18330944'
+                    previous_batch_hash: '0xb4f8b5cb482c7686c5a551ca7b7f005f4254e8bee4a6145f6bb10487f744e3ca'
+                  entries:
+                    - entry_seq: 1
+                      kind: raw_committed
+                      subject_id: raw-1
+                      raw_id: raw-1
+                      child_ordinal: null
+                      operation_id: null
+                      previous_subject_seq: null
+                      occurred_at_unix_ns: 0
+                      content_digest: '0x2e6709af8dbfe7cd5abb2f716924848e527b4486c30c4509b0e4aa8171987335'
+                      metadata_digest: '0x8c642b95858fcf252e843b44bd7feb0225b774516a83a885f6ef1e8ce1ceeb55'
+      responses:
+        '200':
+          description: Identical batch already retained and anchor completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WitnessAcknowledgement'
+        '202':
+          description: Manifest retained; anchoring is pending or in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WitnessAcknowledgement'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Conflicting batch, equivocation, or skipped sequence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: Request body exceeds 4 MiB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Witness could not durably retain this manifest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/streams/{stream_id}/batches/{batch_id}:
+    servers:
+      - url: http://127.0.0.1:9091
+      - url: http://witness:9091
+    parameters:
+      - $ref: '#/components/parameters/StreamID'
+      - $ref: '#/components/parameters/BatchID'
+    get:
+      tags: [Witness admin]
+      operationId: getRetainedBatch
+      summary: Read a retained manifest and its anchor receipt
+      security:
+        - WitnessAdminBearer: []
+      responses:
+        '200':
+          description: Retained manifest, signed acknowledgement, and anchor state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedBatch'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/streams/{stream_id}/status:
+    servers:
+      - url: http://127.0.0.1:9091
+      - url: http://witness:9091
+    parameters:
+      - $ref: '#/components/parameters/StreamID'
+    get:
+      tags: [Witness admin]
+      operationId: getWitnessStatus
+      summary: Read retained/confirmed heads and ledger freshness
+      security:
+        - WitnessAdminBearer: []
+      responses:
+        '200':
+          description: Bounded witness status for the registered stream.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WitnessStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/audits:
+    servers:
+      - url: http://127.0.0.1:9091
+      - url: http://witness:9091
+    post:
+      tags: [Witness admin]
+      operationId: startWitnessLedgerAudit
+      summary: Start one sequential ledger audit
+      description: >-
+        The request body is limited to 64 KiB. Scheduling is durable and
+        idempotent while a ledger scan is active. A scan without an available
+        pinned chain returns a persisted unavailable/incomplete result, never a pass.
+      security:
+        - WitnessAdminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [stream_id, type]
+              properties:
+                stream_id:
+                  $ref: '#/components/schemas/StreamID'
+                type:
+                  const: ledger
+            example:
+              stream_id: '0x1111111111111111111111111111111111111111111111111111111111111111'
+              type: ledger
+      responses:
+        '202':
+          description: Audit scheduled or existing active run returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: Request body exceeds 64 KiB.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Witness storage is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/audits/{run_id}:
+    servers:
+      - url: http://127.0.0.1:9091
+      - url: http://witness:9091
+    parameters:
+      - $ref: '#/components/parameters/RunID'
+    get:
+      tags: [Witness admin]
+      operationId: getWitnessLedgerAudit
+      summary: Read sequential ledger audit progress or result
+      security:
+        - WitnessAdminBearer: []
+      responses:
+        '200':
+          description: Bounded status, captured head, coverage, and findings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    RavenAdminKey:
+      type: apiKey
+      in: header
+      name: X-RAVEN-Admin-Key
+      description: Existing RAVEN admin token header.
+    RavenAdminBearer:
+      type: http
+      scheme: bearer
+      description: Existing RAVEN admin token as a bearer token.
+    WitnessProducerBearer:
+      type: http
+      scheme: bearer
+      description: Token configured through RAVEN_WITNESS_TOKEN.
+    WitnessAdminBearer:
+      type: http
+      scheme: bearer
+      description: Separate admin token configured through RAVEN_WITNESS_ADMIN_TOKEN.
+  parameters:
+    StreamID:
+      name: stream_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/StreamID'
+    BatchID:
+      name: batch_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 9223372036854775807
+    RunID:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  responses:
+    BadRequest:
+      description: Invalid request, identity, or protocol value.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: invalid request}
+    Unauthorized:
+      description: Missing or invalid credential.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: unauthorized}
+    AdminAuthNotConfigured:
+      description: Required admin credential is not configured.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: admin authentication is not configured}
+    NotFound:
+      description: Stream, batch, audit, or evidence entry is unknown.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: not found}
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+          maxLength: 2048
+    StreamID:
+      type: string
+      pattern: '^0x[0-9a-f]{64}$'
+      description: Lowercase 0x-prefixed 32-byte stream identifier.
+    Bytes32:
+      type: string
+      pattern: '^0x[0-9a-f]{64}$'
+    AuditRequest:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [fast, deep, ledger]
+    AuditAccepted:
+      type: object
+      additionalProperties: false
+      required: [run_id, state, type]
+      properties:
+        run_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        state:
+          type: string
+          enum: [queued, running]
+        type:
+          type: string
+          enum: [fast, deep, ledger]
+    AuditRun:
+      type: object
+      additionalProperties: false
+      required: [run_id, type, state, result, started_at, target, verified_prefix]
+      properties:
+        run_id:
+          type: string
+          maxLength: 128
+        type:
+          type: string
+          enum: [fast, deep, ledger]
+        state:
+          type: string
+          enum: [queued, running, completed, failed]
+        result:
+          type: string
+          enum: [passed, failed, incomplete, unavailable, disabled]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, 'null']
+          format: date-time
+        target:
+          type: object
+          additionalProperties: false
+          properties:
+            batch_id: {type: [integer, 'null'], format: int64, minimum: 0}
+            block_number: {type: [integer, 'null'], format: int64, minimum: 0}
+            block_hash: {oneOf: [{$ref: '#/components/schemas/Bytes32'}, {type: 'null'}]}
+            entry_seq: {type: integer, format: int64, minimum: 0}
+        verified_prefix:
+          type: object
+          additionalProperties: false
+          required: [batch_id, entry_seq, block_number]
+          properties:
+            batch_id: {type: integer, format: int64, minimum: 0}
+            entry_seq: {type: integer, format: int64, minimum: 0}
+            block_number: {type: integer, format: int64, minimum: 0}
+        failure_class:
+          type: [string, 'null']
+          maxLength: 128
+        finding_count:
+          type: integer
+          minimum: 0
+    IntegrityStatus:
+      type: object
+      additionalProperties: false
+      required: [enabled, stream_id, local_head, witness_head, chain_identity, chain_head, latest_attempt, last_success]
+      properties:
+        enabled:
+          type: boolean
+        stream_id:
+          oneOf: [{$ref: '#/components/schemas/StreamID'}, {type: 'null'}]
+        local_head:
+          $ref: '#/components/schemas/Head'
+        witness_head:
+          $ref: '#/components/schemas/Head'
+        chain_identity:
+          oneOf: [{$ref: '#/components/schemas/ChainIdentity'}, {type: 'null'}]
+        chain_head:
+          $ref: '#/components/schemas/Head'
+        latest_attempt:
+          oneOf: [{$ref: '#/components/schemas/AuditRun'}, {type: 'null'}]
+        last_success:
+          oneOf: [{$ref: '#/components/schemas/AuditRun'}, {type: 'null'}]
+        backlog_count:
+          type: integer
+          minimum: 0
+        backlog_oldest_at:
+          type: [string, 'null']
+          format: date-time
+        unsealed_entry_count:
+          type: integer
+          minimum: 0
+    Head:
+      type: object
+      additionalProperties: false
+      required: [batch_id, entry_seq, hash]
+      properties:
+        batch_id: {type: integer, format: int64, minimum: 0}
+        entry_seq: {type: integer, format: int64, minimum: 0}
+        hash:
+          oneOf: [{$ref: '#/components/schemas/Bytes32'}, {type: 'null'}]
+    ProofResult:
+      type: object
+      additionalProperties: false
+      required: [entry_seq, proof_state, audit_state]
+      properties:
+        entry_seq:
+          type: integer
+          format: int64
+          minimum: 1
+        proof_state:
+          type: string
+          enum: [pending, witnessed, anchored, unavailable, failed]
+        audit_state:
+          type: string
+          enum: [passed, failed, incomplete, unavailable, disabled]
+        batch:
+          oneOf: [{$ref: '#/components/schemas/BatchDescriptor'}, {type: 'null'}]
+        leaf_index:
+          type: [integer, 'null']
+          minimum: 0
+        tree_size:
+          type: [integer, 'null']
+          minimum: 1
+        siblings:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/Bytes32'
+        witness_acknowledgement:
+          oneOf: [{$ref: '#/components/schemas/WitnessAcknowledgement'}, {type: 'null'}]
+        anchor_receipt:
+          oneOf: [{$ref: '#/components/schemas/AnchorReceipt'}, {type: 'null'}]
+        reason:
+          type: [string, 'null']
+          maxLength: 512
+    BatchDescriptor:
+      type: object
+      additionalProperties: false
+      required: [codec_version, stream_id, batch_id, first_seq, last_seq, leaf_count, merkle_root, previous_batch_hash]
+      properties:
+        codec_version: {type: integer, const: 1}
+        stream_id: {$ref: '#/components/schemas/StreamID'}
+        batch_id: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+        first_seq: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+        last_seq: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+        leaf_count: {type: integer, minimum: 1, maximum: 5000}
+        merkle_root: {$ref: '#/components/schemas/Bytes32'}
+        previous_batch_hash: {$ref: '#/components/schemas/Bytes32'}
+    BatchEntry:
+      type: object
+      additionalProperties: false
+      required: [entry_seq, kind, subject_id, raw_id, child_ordinal, operation_id, previous_subject_seq, occurred_at_unix_ns, content_digest, metadata_digest]
+      properties:
+        entry_seq: {type: integer, format: int64, minimum: 1, maximum: 9223372036854775807}
+        kind:
+          type: string
+          enum: [raw_committed, normalized_written, quarantine_written, replay_failed, replay_resolved, normalized_removed, quarantine_removed]
+        subject_id: {type: string, minLength: 1, maxLength: 1024}
+        raw_id: {type: [string, 'null'], maxLength: 1024}
+        child_ordinal: {type: [integer, 'null'], minimum: 0, maximum: 2147483647}
+        operation_id: {type: [string, 'null'], maxLength: 128}
+        previous_subject_seq: {type: [integer, 'null'], format: int64, minimum: 1, maximum: 9223372036854775807}
+        occurred_at_unix_ns: {type: integer, format: int64}
+        content_digest: {$ref: '#/components/schemas/Bytes32'}
+        metadata_digest: {$ref: '#/components/schemas/Bytes32'}
+    BatchManifest:
+      type: object
+      additionalProperties: false
+      required: [descriptor, entries]
+      properties:
+        descriptor:
+          $ref: '#/components/schemas/BatchDescriptor'
+        entries:
+          type: array
+          minItems: 1
+          maxItems: 5000
+          items:
+            $ref: '#/components/schemas/BatchEntry'
+    WitnessAcknowledgement:
+      type: object
+      additionalProperties: false
+      required: [stream_id, batch_id, batch_hash, key_id, previous_ack_hash, received_at, signature]
+      properties:
+        stream_id: {$ref: '#/components/schemas/StreamID'}
+        batch_id: {type: integer, format: int64, minimum: 1}
+        batch_hash: {$ref: '#/components/schemas/Bytes32'}
+        key_id: {type: string, minLength: 1, maxLength: 128}
+        previous_ack_hash: {$ref: '#/components/schemas/Bytes32'}
+        received_at: {type: string, format: date-time}
+        signature:
+          type: string
+          contentEncoding: base64
+          description: Ed25519 signature over the domain-separated acknowledgement bytes.
+        anchor_state:
+          type: string
+          enum: [pending, confirmed, failed, unavailable]
+        anchor_receipt:
+          oneOf: [{$ref: '#/components/schemas/AnchorReceipt'}, {type: 'null'}]
+    AnchorReceipt:
+      type: object
+      additionalProperties: false
+      required: [chain_id, contract_address, tx_hash, block_number, block_hash, batch_hash, status]
+      properties:
+        chain_id: {type: integer, const: 31337}
+        contract_address:
+          type: string
+          pattern: '^0x[0-9a-f]{40}$'
+        tx_hash: {$ref: '#/components/schemas/Bytes32'}
+        block_number: {type: integer, format: int64, minimum: 0}
+        block_hash: {$ref: '#/components/schemas/Bytes32'}
+        batch_hash: {$ref: '#/components/schemas/Bytes32'}
+        status:
+          type: string
+          enum: [confirmed, failed, reorged]
+    RetainedBatch:
+      type: object
+      additionalProperties: false
+      required: [manifest, acknowledgement]
+      properties:
+        manifest: {$ref: '#/components/schemas/BatchManifest'}
+        acknowledgement: {$ref: '#/components/schemas/WitnessAcknowledgement'}
+    WitnessStatus:
+      type: object
+      additionalProperties: false
+      required: [stream_id, chain_identity, retained_head, confirmed_head, ledger_audit]
+      properties:
+        stream_id: {$ref: '#/components/schemas/StreamID'}
+        chain_identity:
+          oneOf: [{$ref: '#/components/schemas/ChainIdentity'}, {type: 'null'}]
+        retained_head: {$ref: '#/components/schemas/Head'}
+        confirmed_head: {$ref: '#/components/schemas/Head'}
+        backlog_count: {type: integer, minimum: 0}
+        ledger_audit:
+          oneOf: [{$ref: '#/components/schemas/AuditRun'}, {type: 'null'}]
+    ChainIdentity:
+      type: object
+      additionalProperties: false
+      required: [chain_id, genesis_block_hash, contract_address, deployment_block, deployment_block_hash, runtime_code_hash]
+      properties:
+        chain_id: {type: integer, const: 31337}
+        genesis_block_hash: {$ref: '#/components/schemas/Bytes32'}
+        contract_address:
+          type: string
+          pattern: '^0x[0-9a-f]{40}$'
+        deployment_block: {type: integer, format: int64, minimum: 0}
+        deployment_block_hash: {$ref: '#/components/schemas/Bytes32'}
+        runtime_code_hash: {$ref: '#/components/schemas/Bytes32'}
