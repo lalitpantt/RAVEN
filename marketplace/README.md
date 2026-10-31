@@ -1,0 +1,7 @@
+# Parser pack publishing
+
+The official marketplace is owner-published. Add validated YAML and fixtures, then update `metadata.json`. Use `packs` metadata for vendor/product/model coverage and `releases` entries keyed by `pack-name@version` for changelog, `withdrawn`, `min_raven`, `required_decoders`, and RFC3339 `published_at` values. Required decoder names currently match the supported parser families: `syslog`, `json`, `csv`, `cef`, `xml`, `leef`, and `text`.
+
+A published `name@version` and its SHA-256 are immutable. Keep prior YAML under `marketplace/releases/`; the publisher compares against the committed signed catalog and fails if a published version changes or disappears. The committed `internal/marketplace/catalog-seed.json` is the binary seed catalog. Run the publisher with the owner-held signing key to regenerate it, review and commit the result with the pack changes, then let the protected `marketplace-publish` GitHub environment publish the static site. CI also verifies that shipped packs match the signed seed before publishing or building release archives.
+
+The Ed25519 private key is stored locally at `~/.config/raven/marketplace-signing-key.b64`; the GitHub Actions secret `RAVEN_MARKETPLACE_SIGNING_KEY` must contain the same base64 key. The current owner key ID is `raven-market-2026-v1`. Never put the private key in Git or expose it to pull-request workflows. Customers need a RAVEN build that trusts this key before they can refresh a catalog signed with it.
