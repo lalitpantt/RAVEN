@@ -116,9 +116,12 @@ Without `--marketplace-online`, RAVEN uses its signed catalog embedded in the bi
 | Formats | Syslog, JSON, XML, CSV, CEF, LEEF, and proprietary/application text via YAML parser packs. Syslog can wrap another supported payload format. |
 | Source packs | Included examples cover firewalls and other network devices, Linux auth, web access, applications, database audit, cloud audit, containers, endpoint IDS, IAM, IoT, and proprietary appliances. A pack provides source matching, extraction, typing, and normalization rules; a new source using an existing decoder can be onboarded without recompiling. |
 | Processing | Original bytes and SHA-256 receipt, format detection, pack matching, OCSF-based normalization, `unmapped` source fields, quarantine and replay, raw/event lineage, and lifecycle counters. |
+| Analysis | Optional typed device inventory and rule YAML, strict validation, durable observations, source identity resolution, explainable device telemetry, exact event rules, rolling event-count and quarantine-ratio rules, heartbeat missing-report findings, durable finding history, and read-only status/device/source/finding APIs with evidence links. Preview rules with `raven analysis test`; the dedicated analysis dashboard remains planned. |
 | Output | Stdout and NDJSON file by default; configurable HTTP SIEM, Kafka, Parquet, and NDJSON sinks through source/sink YAML and a SQLite-backed outbox. External delivery is at least once, so downstream systems should deduplicate by event ID. |
 
-`packs/`, `sources/`, `sinks/`, and `schemas/` in this repository are the configuration examples and validation assets. The browser UI offers event, trace, quarantine, parser-pack, and configuration views; the ingestion HTTP API and the UI/control API use separate listeners.
+`packs/`, `sources/`, `sinks/`, `analysis/`, and `schemas/` in this repository are the configuration examples and validation assets. The browser UI offers event, trace, quarantine, parser-pack, and configuration views; the ingestion HTTP API and the UI/control API use separate listeners.
+
+Analysis is disabled when `analysis/devices/` and `analysis/rules/` have no resources. Validate local files with `raven analysis validate`; the reference YAML under `analysis/examples/` is not loaded automatically. Preview a normalized-event sample with `raven analysis test -rule <id> -sample <path>`. When enabled, read-only status, telemetry, and finding history are available under `/api/v1/analysis/`; window, quality, and heartbeat findings link to existing event evidence. See [CLI.md](CLI.md#analysis-inventory-and-configuration) for setup and behavior.
 
 ## Evidence integrity and blockchain anchoring
 

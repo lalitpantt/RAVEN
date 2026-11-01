@@ -14,6 +14,7 @@ Running `raven` starts RAVEN in the foreground. Listener defaults bind to loopba
 | `-packs-dir <dir>` | `packs` | Active YAML parser packs and their hidden `.marketplace/` cache/management files. Paths are relative to the process working directory unless absolute. |
 | `-sources-dir <dir>` | `sources` | YAML source adapter definitions. |
 | `-sinks-dir <dir>` | `sinks` | YAML output adapter definitions. |
+| `-analysis-dir <dir>` | `analysis` | Analysis device inventory and rules. Use `none` to disable explicitly; a missing or empty configuration leaves Analysis off. |
 | `-workers <n>` | `4` | Processing worker count. |
 | `-file <file>` | off | Read one file on startup. RAVEN exits after processing only when other inputs are disabled. |
 | `-stdin` | `false` | Read stdin; piped input is also detected automatically. |
@@ -96,6 +97,21 @@ raven integrity verify --type ledger --wait --wait-timeout 2m
 Integrity is disabled unless a new stream ID and installation epoch are configured on a fresh RAVEN database. Witness and chain settings are provided by the local lab/service configuration, not by a separate `raven` CLI subcommand. The Anvil configuration in this repository is a development simulation; it is not a public-network deployment. See [plans/final-run.md](plans/final-run.md) for the complete native and Docker commands, dashboard, scans, and simulator.
 
 The GitHub release archives contain the RAVEN executable, not separate `raven-witness`, Anvil, Forge, Solidity contracts, or local blockchain secrets/configuration. The integrity CLI/API/UI are part of the RAVEN executable and remain disabled until configured. CI builds and tests the contract without attaching contract artifacts to release assets.
+
+## Analysis inventory and configuration
+
+Analysis is opt-in. Put device resources in `analysis/devices/` and rule resources in `analysis/rules/`; examples under `analysis/examples/` are not loaded automatically. Validate the complete snapshot before starting RAVEN:
+
+```sh
+raven analysis validate
+raven analysis validate --analysis-dir ./my-analysis
+raven analysis test -rule interface-down -sample analysis/examples/samples/interface-down.json
+raven -analysis-dir ./my-analysis
+```
+
+The validator checks strict YAML fields, resource IDs and versions, source categories, unique aliases, heartbeat rule references, bounded durations, and Go RE2 expressions. Event rules match individual normalized events; window rules count matching events with configurable grouping, thresholds, and hold-downs; quality rules track recent quarantine ratios; and configured heartbeat devices create missing-report findings after warning/critical deadlines, with maintenance suppression. `analysis test` previews an event rule against one normalized-event JSON sample and makes no database writes. Invalid Analysis configuration is reported and disables Analysis while normal ingestion continues. Use `-analysis-dir none` to disable it explicitly. See [analysis/README.md](analysis/README.md) for the resource format and examples.
+
+With a valid inventory loaded, the management API serves read-only telemetry at `GET /api/v1/analysis/status`, `GET /api/v1/analysis/devices`, `GET /api/v1/analysis/sources`, and `GET /api/v1/analysis/findings`. Finding details at `/api/v1/analysis/findings/{finding_id}` include paginated transition history and links to the existing Events, Trace, Verify, and Raw views. List endpoints support `limit` (1–500) and `offset`; finding status can be `open` (the default), `clearing`, `resolved`, or `all`. Source resolution can be `unknown`, `ambiguous`, or `unassigned` (the default). The dedicated analysis dashboard remains planned.
 
 ## Decoded formats
 

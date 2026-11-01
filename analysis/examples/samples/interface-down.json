@@ -1,0 +1,9 @@
+{
+  "raven": {
+    "event_id": "raven-evt-analysis-sample",
+    "source_category": "network_device"
+  },
+  "ocsf": {
+    "activity_name": "interface_down"
+  }
+}
