@@ -17,6 +17,29 @@ export interface AnalysisStatus {
   evaluated_at: string;
 }
 
+export interface AnalysisBaselineState {
+  rule_id: string;
+  owner_type: 'device' | 'source';
+  owner_id: string;
+  instance_key: string;
+  algorithm: string;
+  algorithm_version: string;
+  status: 'warming_up' | 'ready' | 'anomaly' | 'maintenance';
+  direction?: 'high' | 'low';
+  minimum_history: number;
+  history_count: number;
+  first_seen_at: string;
+  interval_start: string;
+  interval_end: string;
+  observed_count: number;
+  baseline_median: number;
+  baseline_mad: number;
+  lower_threshold: number;
+  upper_threshold: number;
+  finding_id?: string;
+  updated_at: string;
+}
+
 export interface AnalysisDevice {
   device_id: string;
   name: string;

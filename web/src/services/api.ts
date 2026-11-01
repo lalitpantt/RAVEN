@@ -3,7 +3,7 @@ import { NormalizedEvent, EventTrace, QuarantineEntry, SourceSummary } from '../
 import { ParserPackSummary, PackValidationResponse, MarketplacePack } from '../types/pack';
 import { RuntimeConfig } from '../types/config';
 import { ConnectionSummary, ConnectionValidationResponse, ConnectionTestResponse, ConnectionApplyResponse } from '../types/connection';
-import { AnalysisDevice, AnalysisFinding, AnalysisFindingDetail, AnalysisSource, AnalysisStatus } from '../types/analysis';
+import { AnalysisBaselineState, AnalysisDevice, AnalysisFinding, AnalysisFindingDetail, AnalysisSource, AnalysisStatus } from '../types/analysis';
 
 const BASE_URL = '/api/v1';
 
@@ -70,6 +70,8 @@ export const apiService = {
   getStats: () => fetchJSON<SystemStats>('/stats'),
 
   getAnalysisStatus: () => fetchJSON<AnalysisStatus>('/analysis/status'),
+  listAnalysisBaselines: (params: { limit?: number; offset?: number } = {}) =>
+    fetchJSON<{ baselines: AnalysisBaselineState[]; total: number; limit: number; offset: number }>(`/analysis/baselines?${analysisQuery(params)}`),
   listAnalysisDevices: (params: { state?: string; category?: string; site?: string; device?: string; window?: string; limit?: number; offset?: number } = {}) =>
     fetchJSON<{ devices: AnalysisDevice[]; total: number; limit: number; offset: number }>(`/analysis/devices?${analysisQuery(params)}`),
   listAnalysisSources: (params: { resolution?: string; limit?: number; offset?: number } = {}) =>

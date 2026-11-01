@@ -13,6 +13,7 @@ import {
   X
 } from 'lucide-react';
 import { Badge } from './Badge';
+import ravenLogo from '../../../assets/web-ui-logo.png';
 
 interface NavbarProps {
   currentTab: string;
@@ -62,9 +63,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             </button>
 
             <div className="flex items-center space-x-3 cursor-pointer group" onClick={() => onSelectTab('dashboard')}>
-              <div className="bg-[#1f6feb] hover:bg-[#388bfd] text-white px-2.5 py-1 rounded-md font-mono font-bold text-sm tracking-wider flex items-center shadow-xs transition-colors">
-                RAVEN
-              </div>
+              <img src={ravenLogo} alt="RAVEN" className="h-10 w-auto object-contain" />
             </div>
           </div>
 

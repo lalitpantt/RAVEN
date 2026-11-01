@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertTriangle, Clock3, ExternalLink, RefreshCw, Search, ShieldCheck } from 'lucide-react';
-import { AnalysisDevice, AnalysisFinding, AnalysisFindingDetail, AnalysisSource, AnalysisStatus, DeviceState } from '../types/analysis';
+import { AnalysisBaselineState, AnalysisDevice, AnalysisFinding, AnalysisFindingDetail, AnalysisSource, AnalysisStatus, DeviceState } from '../types/analysis';
 import { apiService } from '../services/api';
 import { Badge } from '../components/Badge';
 import { MetricCard } from '../components/MetricCard';
@@ -69,6 +69,8 @@ function Pager({ total, offset, onChange }: { total: number; offset: number; onC
 
 export const Analysis: React.FC<AnalysisProps> = ({ onNavigate }) => {
   const [status, setStatus] = useState<AnalysisStatus | null>(null);
+  const [baselines, setBaselines] = useState<AnalysisBaselineState[]>([]);
+  const [baselineTotal, setBaselineTotal] = useState(0);
   const [devices, setDevices] = useState<AnalysisDevice[]>([]);
   const [deviceTotal, setDeviceTotal] = useState(0);
   const [sources, setSources] = useState<AnalysisSource[]>([]);
@@ -87,6 +89,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ onNavigate }) => {
   const [findingWindow, setFindingWindow] = useState('');
   const [findingOffset, setFindingOffset] = useState(0);
   const [sourceOffset, setSourceOffset] = useState(0);
+  const [baselineOffset, setBaselineOffset] = useState(0);
   const [selectedFinding, setSelectedFinding] = useState<string | null>(null);
   const [findingDetail, setFindingDetail] = useState<AnalysisFindingDetail | null>(null);
   const [historyOffset, setHistoryOffset] = useState(0);
@@ -104,14 +107,17 @@ export const Analysis: React.FC<AnalysisProps> = ({ onNavigate }) => {
     const currentRequest = ++requestID.current;
     setLoading(true);
     try {
-      const [statusResponse, deviceResponse, sourceResponse, findingResponse] = await Promise.all([
+      const [statusResponse, baselineResponse, deviceResponse, sourceResponse, findingResponse] = await Promise.all([
         apiService.getAnalysisStatus(),
+        apiService.listAnalysisBaselines({ limit: pageSize, offset: baselineOffset }),
         apiService.listAnalysisDevices({ state: deviceState, category, site, device: deviceSearch, window: deviceWindow, limit: pageSize, offset: deviceOffset }),
         apiService.listAnalysisSources({ resolution: 'unassigned', limit: pageSize, offset: sourceOffset }),
         apiService.listAnalysisFindings({ status: findingStatus, rule_id: ruleID, device: findingDevice, window: findingWindow, limit: pageSize, offset: findingOffset }),
       ]);
       if (currentRequest === requestID.current) {
         setStatus(statusResponse);
+        setBaselines(baselineResponse.baselines);
+        setBaselineTotal(baselineResponse.total);
         setDevices(deviceResponse.devices);
         setDeviceTotal(deviceResponse.total);
         setSources(sourceResponse.sources);
@@ -127,7 +133,7 @@ export const Analysis: React.FC<AnalysisProps> = ({ onNavigate }) => {
       inFlight.current = false;
       if (currentRequest === requestID.current) setLoading(false);
     }
-  }, [category, deviceOffset, deviceSearch, deviceState, deviceWindow, findingDevice, findingOffset, findingStatus, findingWindow, ruleID, site, sourceOffset]);
+  }, [baselineOffset, category, deviceOffset, deviceSearch, deviceState, deviceWindow, findingDevice, findingOffset, findingStatus, findingWindow, ruleID, site, sourceOffset]);
 
   useEffect(() => {
     void refresh();
@@ -211,6 +217,12 @@ export const Analysis: React.FC<AnalysisProps> = ({ onNavigate }) => {
           </div>
         </div>
         {status?.pending_count ? <p className="mt-3 flex items-center gap-1.5 text-xs text-amber-300"><Clock3 className="h-3.5 w-3.5" />Oldest queued observation {timeAgo(status.oldest_pending_at)} · {Math.floor(status.oldest_pending_age_seconds)}s old</p> : null}
+      </section>
+
+      <section aria-labelledby="baselines-heading" className="overflow-hidden rounded-lg border border-[#30363d] bg-[#161b22]">
+        <div className="border-b border-[#21262d] p-4"><h2 id="baselines-heading" className="text-sm font-mono font-bold text-[#f0f6fc]">Optional rate baselines</h2><p className="mt-1 text-xs text-[#8b949e]">Rolling median/MAD checks are disabled unless a baseline rule is configured. New groups remain visibly warming up until enough complete intervals are collected.</p></div>
+        <div className="overflow-x-auto"><table className="w-full min-w-[900px] text-left text-xs font-mono"><caption className="sr-only">Baseline readiness and anomaly measurements</caption><thead className="bg-[#0d1117] text-[#8b949e]"><tr><th className="px-4 py-3 font-medium">Rule / owner</th><th className="px-4 py-3 font-medium">State</th><th className="px-4 py-3 font-medium">History</th><th className="px-4 py-3 font-medium">Observed / expected</th><th className="px-4 py-3 font-medium">Compared interval</th></tr></thead><tbody className="divide-y divide-[#21262d]">{baselines.length === 0 ? <tr><td colSpan={5} className="px-4 py-8 text-center text-[#8b949e]">No baseline rules are configured, or no matching source groups have been observed.</td></tr> : baselines.map((baseline) => <tr key={`${baseline.rule_id}:${baseline.owner_type}:${baseline.owner_id}:${baseline.instance_key}`}><td className="px-4 py-3 text-[#c9d1d9]">{baseline.rule_id}<div className="mt-1 text-[11px] text-[#8b949e]">{baseline.owner_type}: {baseline.owner_id}</div><div className="mt-1 text-[11px] text-[#6e7681]">{baseline.algorithm} v{baseline.algorithm_version}</div></td><td className="px-4 py-3"><Badge variant={baseline.status === 'anomaly' ? 'amber' : baseline.status === 'maintenance' ? 'gray' : baseline.status === 'ready' ? 'green' : 'gray'}>{baseline.direction ? `${baseline.status} · ${baseline.direction}` : baseline.status.replace(/_/g, ' ')}</Badge></td><td className="px-4 py-3 text-[#c9d1d9]">{baseline.history_count} / {baseline.minimum_history} complete intervals</td><td className="px-4 py-3 text-[#c9d1d9]">{baseline.observed_count} / median {baseline.baseline_median.toFixed(1)}<div className="mt-1 text-[11px] text-[#8b949e]">MAD {baseline.baseline_mad.toFixed(1)} · expected range {baseline.lower_threshold.toFixed(1)}–{baseline.upper_threshold.toFixed(1)}</div></td><td className="px-4 py-3 text-[#8b949e]">{dateLabel(baseline.interval_start)}<div className="mt-1">to {dateLabel(baseline.interval_end)}</div></td></tr>)}</tbody></table></div>
+        <Pager total={baselineTotal} offset={baselineOffset} onChange={setBaselineOffset} />
       </section>
 
       <section aria-label="Analysis summary" className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
