@@ -39,7 +39,7 @@ services:
       context: .
       dockerfile: Dockerfile
     user: "${RAVEN_UID:-1000}:${RAVEN_GID:-1000}"
-    command: ["-db", "/data/raven.db", "-packs-dir", "/raven/packs", "-sources-dir", "/raven/sources", "-sinks-dir", "/raven/sinks", "-syslog-udp", ":1514", "-syslog-tcp", ":1514", "-http", ":8080", "-ui", ":9090", "-inbox", "/data/inbox", "-output-file", "/data/output/normalized.ndjson"]
+    command: ["-db", "/data/raven.db", "-analysis-dir", "/raven/analysis-demo", "-packs-dir", "/raven/packs", "-sources-dir", "/raven/sources", "-sinks-dir", "/raven/sinks", "-syslog-udp", ":1514", "-syslog-tcp", ":1514", "-http", ":8080", "-ui", ":9090", "-inbox", "/data/inbox", "-output-file", "/data/output/normalized.ndjson"]
     environment:
       RAVEN_STREAM_ID: "${RAVEN_STREAM_ID:-}"
       RAVEN_INSTALLATION_EPOCH: "${RAVEN_INSTALLATION_EPOCH:-}"
@@ -66,6 +66,6 @@ services:
     build:
       context: .
       dockerfile: docker/sim/Dockerfile
-    command: ["--source", "app", "--scenario", "mixed", "--format", "http-post", "--target", "http://raven:8080/api/v1/ingest", "--rate", "10", "--count", "500"]
+    command: ["--source", "all", "--scenario", "mixed", "--format", "http-post", "--target", "http://raven:8080/api/v1/ingest", "--rate", "10", "--count", "0"]
     depends_on:
       - raven

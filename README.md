@@ -116,12 +116,16 @@ Without `--marketplace-online`, RAVEN uses its signed catalog embedded in the bi
 | Formats | Syslog, JSON, XML, CSV, CEF, LEEF, and proprietary/application text via YAML parser packs. Syslog can wrap another supported payload format. |
 | Source packs | Included examples cover firewalls and other network devices, Linux auth, web access, applications, database audit, cloud audit, containers, endpoint IDS, IAM, IoT, and proprietary appliances. A pack provides source matching, extraction, typing, and normalization rules; a new source using an existing decoder can be onboarded without recompiling. |
 | Processing | Original bytes and SHA-256 receipt, format detection, pack matching, OCSF-based normalization, `unmapped` source fields, quarantine and replay, raw/event lineage, and lifecycle counters. |
-| Analysis | Optional typed device inventory and rule YAML, strict validation, durable observations, source identity resolution, explainable device telemetry, exact event rules, rolling event-count and quarantine-ratio rules, heartbeat missing-report findings, durable finding history, and read-only status/device/source/finding APIs with evidence links, plus a live Analysis dashboard with filtered device health, unknown sources, findings, and evidence navigation. Preview rules with `raven analysis test`. |
+| Analysis | Optional typed device inventory and rule YAML, strict validation, durable observations, source identity resolution, explainable device telemetry, exact event rules, rolling event-count and quarantine-ratio rules, heartbeat missing-report findings, optional experimental rolling median/MAD rate baselines, durable finding history, and read-only status/device/source/baseline/finding APIs with evidence links, plus a live Analysis dashboard with filtered device health, baseline warm-up, unknown sources, findings, and evidence navigation. Preview rules with `raven analysis test`. |
 | Output | Stdout and NDJSON file by default; configurable HTTP SIEM, Kafka, Parquet, and NDJSON sinks through source/sink YAML and a SQLite-backed outbox. External delivery is at least once, so downstream systems should deduplicate by event ID. |
 
 `packs/`, `sources/`, `sinks/`, `analysis/`, and `schemas/` in this repository are the configuration examples and validation assets. The browser UI offers event, trace, quarantine, parser-pack, and configuration views; the ingestion HTTP API and the UI/control API use separate listeners.
 
 Analysis is disabled when `analysis/devices/` and `analysis/rules/` have no resources. Validate local files with `raven analysis validate`; the reference YAML under `analysis/examples/` is not loaded automatically. Preview a normalized-event sample with `raven analysis test -rule <id> -sample <path>`. When enabled, read-only status, telemetry, and finding history are available under `/api/v1/analysis/` and the Analysis UI tab; window, quality, and heartbeat findings link back to event/raw evidence. See [CLI.md](CLI.md#analysis-inventory-and-configuration) for setup and behavior.
+
+The blockchain development runner explicitly loads a runnable six-device, five-rule Analysis demo from `analysis/demo/`; ordinary project startup remains opt-in. Its logsim walkthrough seeds a heartbeat, raises firewall and SSH findings, and runs all seven source generators together so the Analysis page can show green, yellow, red, disabled/grey, and unknown sources. See [analysis/README.md](analysis/README.md#runnable-blockchain-demo) and [plans/final-run.md](plans/final-run.md#analysis-demo-with-the-blockchain-lab).
+
+Before upgrading, stop RAVEN and back up its SQLite database; additive schema migrations run automatically at startup. The opt-in Analysis performance release gate and complete local/Docker run commands are documented in [plans/final-run.md](plans/final-run.md#analysis-operations-and-release-gate).
 
 ## Evidence integrity and blockchain anchoring
 
@@ -189,7 +193,7 @@ Without Docker, build `logsim` into `bin/` with `mkdir -p bin && go build -o bin
 ./bin/logsim --source app --scenario normal --format http-post --target http://127.0.0.1:8080/api/v1/ingest --rate 5 --count 50
 ```
 
-`logsim --source` accepts `firewall`, `asa`, `sshd`, `ids`, `webserver`, `app`, `database`, or `all`; it can emit to stdout, syslog UDP/TCP/TLS, HTTP POST, or files. The data is synthetic, not an enterprise source qualification. For the published measurements and repeatable 10,000-event methods, use [BENCHMARKING.md](BENCHMARKING.md).
+`logsim --source` accepts `firewall`, `asa`, `sshd`, `ids`, `webserver`, `app`, `database`, or `all`; it can emit to stdout, syslog UDP/TCP/TLS, HTTP POST, or files. `app --scenario heartbeat` emits the one-shot heartbeat used by the blockchain Analysis demo; it is excluded from the general mixed rotation. The data is synthetic, not an enterprise source qualification. For the published measurements and repeatable 10,000-event methods, use [BENCHMARKING.md](BENCHMARKING.md).
 
 ## Deployment modes and safety
 

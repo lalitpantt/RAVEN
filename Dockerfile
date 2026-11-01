@@ -16,6 +16,7 @@ COPY --from=builder --chown=10001:10001 /image-packs/ /raven/packs/
 COPY schemas/ /raven/schemas/
 COPY --chown=10001:10001 sources/ /raven/sources/
 COPY --chown=10001:10001 sinks/ /raven/sinks/
+COPY --chown=10001:10001 analysis/demo/ /raven/analysis-demo/
 COPY --from=builder --chown=10001:10001 /image-data/ /data/
 USER 10001:10001
 WORKDIR /raven
