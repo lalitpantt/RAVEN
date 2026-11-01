@@ -1,0 +1,23 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: interface-down
+  version: 1.0.0
+  description: Raise a critical finding when a normalized event reports an interface down
+spec:
+  kind: event
+  sourceCategory: network_device
+  match:
+    fields:
+      - path: activity_name
+        op: eq
+        value: interface_down
+  clear:
+    - path: activity_name
+      op: eq
+      value: interface_up
+  finding:
+    severity: critical
+    state: red
+    title: Network interface is down
+    clearAfter: 30s

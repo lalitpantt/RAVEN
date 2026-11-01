@@ -1,0 +1,23 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: edge-router-01
+  version: 1.0.0
+  description: Branch edge router
+spec:
+  displayName: Edge Router 01
+  sourceCategory: network_device
+  aliases:
+    syslog_host:
+      - edge-router-01.example.internal
+    source_ip:
+      - 10.20.0.1
+  labels:
+    site: hq
+    criticality: high
+  reporting:
+    mode: heartbeat
+    heartbeatRule: device-heartbeat
+    expectedInterval: 60s
+    warningAfter: 120s
+    criticalAfter: 300s

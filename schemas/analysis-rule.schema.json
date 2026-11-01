@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RAVEN Analysis Rule",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "raven.io/v1" },
+    "kind": { "const": "AnalysisRule" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": {
+      "type": "object",
+      "required": ["kind", "match", "finding"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["event", "heartbeat", "window", "quality"] },
+        "enabled": { "type": "boolean", "default": true },
+        "description": { "type": "string", "maxLength": 1024 },
+        "sourceCategory": { "type": "string", "enum": ["network_device", "server", "os", "endpoint", "application", "database", "cloud", "container", "iam", "iot", "other"] },
+        "match": { "type": "object", "required": ["fields"], "additionalProperties": false, "properties": { "fields": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/condition" } } } },
+        "clear": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/condition" } },
+        "window": { "$ref": "#/$defs/window" },
+        "finding": { "$ref": "#/$defs/finding" }
+      }
+    }
+  },
+  "$defs": {
+    "metadata": { "type": "object", "required": ["name", "version"], "additionalProperties": false, "properties": { "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }, "version": { "type": "string", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$" }, "description": { "type": "string", "maxLength": 1024 } } },
+    "duration": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "condition": {
+      "type": "object",
+      "required": ["path", "op", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,127}$" },
+        "op": { "enum": ["eq", "in", "gt", "gte", "lt", "lte", "contains", "regex"] },
+        "value": {}
+      },
+      "allOf": [
+        { "if": { "properties": { "op": { "const": "in" } } }, "then": { "properties": { "value": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "type": ["string", "number", "boolean"] } } } } },
+        { "if": { "properties": { "op": { "enum": ["contains", "regex"] } } }, "then": { "properties": { "value": { "type": "string", "minLength": 1, "maxLength": 256 } } } },
+        { "if": { "properties": { "op": { "enum": ["gt", "gte", "lt", "lte"] } } }, "then": { "properties": { "value": { "type": "number" } } } },
+        { "if": { "properties": { "op": { "const": "eq" } } }, "then": { "properties": { "value": { "type": ["string", "number", "boolean"] } } } }
+      ]
+    },
+    "window": { "type": "object", "required": ["duration", "countAtLeast"], "additionalProperties": false, "properties": { "duration": { "$ref": "#/$defs/duration" }, "groupBy": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]{0,127}$" } }, "countAtLeast": { "type": "integer", "minimum": 1, "maximum": 1000000000 } } },
+    "finding": { "type": "object", "required": ["severity", "state", "title"], "additionalProperties": false, "properties": { "severity": { "enum": ["low", "medium", "high", "critical"] }, "state": { "enum": ["yellow", "red"] }, "title": { "type": "string", "minLength": 1, "maxLength": 256 }, "for": { "$ref": "#/$defs/duration" }, "clearAfter": { "$ref": "#/$defs/duration" } } }
+  },
+  "allOf": [
+    { "if": { "properties": { "spec": { "properties": { "kind": { "enum": ["event", "heartbeat"] } } } } }, "then": { "properties": { "spec": { "not": { "required": ["window"] } } } } },
+    { "if": { "properties": { "spec": { "properties": { "kind": { "enum": ["window", "quality"] } } } } }, "then": { "properties": { "spec": { "required": ["window"] } } } },
+    { "if": { "properties": { "spec": { "properties": { "kind": { "enum": ["event", "window", "quality"] } } } } }, "then": { "properties": { "spec": { "required": ["clear"], "properties": { "finding": { "required": ["clearAfter"] } } } } } }
+  ]
+}

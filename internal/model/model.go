@@ -108,19 +108,24 @@ type NormalizedEvent struct {
 
 // QuarantineEntry represents an unparseable, unmatched, or schema-violating event parked in the dead-letter store.
 type QuarantineEntry struct {
-	QuarantineID   string     `json:"quarantine_id"`             // e.g. "raven-quar-20260920-00000001"
-	RawID          string     `json:"raw_id"`                    // pointer to raw event
-	RecordOrdinal  int        `json:"record_ordinal"`            // child record index in batch (0 for standalone)
-	RawSHA256      string     `json:"raw_sha256"`                // SHA-256 digest
-	Stage          string     `json:"stage"`                     // stage where failure occurred
-	Reason         string     `json:"reason"`                    // "unknown_source", "parse_error", "schema_violation", "conversion_error"
-	ErrorDetails   string     `json:"error_details"`             // detailed error message or trace
-	RawPreview     string     `json:"raw_preview"`               // hex/ASCII preview snippet of raw bytes
-	CandidatePacks []string   `json:"candidate_packs,omitempty"` // candidate packs if ambiguous
-	ReplayEligible bool       `json:"replay_eligible"`           // true if can be reprocessed via parser pack
-	QuarantinedAt  time.Time  `json:"quarantined_at"`            // timestamp quarantined
-	ReplayedAt     *time.Time `json:"replayed_at,omitempty"`     // timestamp of last replay attempt
+	QuarantineID   string                `json:"quarantine_id"`             // e.g. "raven-quar-20260920-00000001"
+	RawID          string                `json:"raw_id"`                    // pointer to raw event
+	RecordOrdinal  int                   `json:"record_ordinal"`            // child record index in batch (0 for standalone)
+	RawSHA256      string                `json:"raw_sha256"`                // SHA-256 digest
+	Stage          string                `json:"stage"`                     // stage where failure occurred
+	Reason         string                `json:"reason"`                    // "unknown_source", "parse_error", "schema_violation", "conversion_error"
+	ErrorDetails   string                `json:"error_details"`             // detailed error message or trace
+	RawPreview     string                `json:"raw_preview"`               // hex/ASCII preview snippet of raw bytes
+	CandidatePacks []string              `json:"candidate_packs,omitempty"` // candidate packs if ambiguous
+	ReplayEligible bool                  `json:"replay_eligible"`           // true if can be reprocessed via parser pack
+	QuarantinedAt  time.Time             `json:"quarantined_at"`            // timestamp quarantined
+	ReplayedAt     *time.Time            `json:"replayed_at,omitempty"`     // timestamp of last replay attempt
+	AnalysisHints  AnalysisIdentityHints `json:"-"`
 }
+
+// AnalysisIdentityHints are bounded, derived identifiers used only by the
+// asynchronous Analysis projection. They never enter event or API payloads.
+type AnalysisIdentityHints map[string]string
 
 // LossAccountingStats tracks the mathematical invariant:
 // accepted = normalized + quarantined + pending

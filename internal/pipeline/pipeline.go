@@ -307,6 +307,28 @@ func safePreview(b []byte, maxLen int) string {
 	return "hex:" + hex.EncodeToString(b[:limit])
 }
 
+func analysisIdentityHints(raw *model.RawEvent, decoded *model.DecodedRecord) model.AnalysisIdentityHints {
+	hints := model.AnalysisIdentityHints{}
+	if raw != nil && raw.SourceIP != "" {
+		hints["source_ip"] = raw.SourceIP
+	}
+	if decoded == nil {
+		return hints
+	}
+	if value, ok := decoded.Headers["syslog_host"].(string); ok && value != "" && value != "-" {
+		hints["syslog_host"] = value
+	}
+	for _, namespace := range []string{"syslog_host", "host", "server"} {
+		if _, exists := hints[namespace]; exists {
+			continue
+		}
+		if value, ok := decoded.Fields[namespace].(string); ok && value != "" && value != "-" {
+			hints[namespace] = value
+		}
+	}
+	return hints
+}
+
 func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) {
 	var history []model.ProcessingStep
 
@@ -364,6 +386,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 			RawPreview:     preview,
 			ReplayEligible: true,
 			QuarantinedAt:  time.Now().UTC(),
+			AnalysisHints:  analysisIdentityHints(rawEvt, nil),
 		}) {
 			_ = p.store.UpdateStatus(ctx, rawEvt.RawID, model.StatusAccepted)
 		} else {
@@ -406,6 +429,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 			RawPreview:     preview,
 			ReplayEligible: false,
 			QuarantinedAt:  time.Now().UTC(),
+			AnalysisHints:  analysisIdentityHints(rawEvt, nil),
 		}) {
 			_ = p.store.UpdateStatus(ctx, rawEvt.RawID, model.StatusAccepted)
 		} else {
@@ -464,6 +488,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 					RawPreview:     childPreview,
 					ReplayEligible: true,
 					QuarantinedAt:  time.Now().UTC(),
+					AnalysisHints:  analysisIdentityHints(rawEvt, decRec),
 				}) {
 					unresolvedChild = true
 				}
@@ -494,6 +519,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 					RawPreview:     childPreview,
 					ReplayEligible: true,
 					QuarantinedAt:  time.Now().UTC(),
+					AnalysisHints:  analysisIdentityHints(rawEvt, decRec),
 				}) {
 					unresolvedChild = true
 				}
@@ -511,6 +537,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 					RawPreview:     childPreview,
 					ReplayEligible: true,
 					QuarantinedAt:  time.Now().UTC(),
+					AnalysisHints:  analysisIdentityHints(rawEvt, decRec),
 				}) {
 					unresolvedChild = true
 				}
@@ -570,6 +597,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 				RawPreview:     childPreview,
 				ReplayEligible: true,
 				QuarantinedAt:  time.Now().UTC(),
+				AnalysisHints:  analysisIdentityHints(rawEvt, decRec),
 			}) {
 				unresolvedChild = true
 			}
@@ -583,10 +611,10 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 		}
 		var storeErr error
 		if p.store != nil {
-			storeErr = p.store.StoreNormalizedWithOutbox(ctx, normalized, destinations)
+			storeErr = p.store.StoreNormalizedWithOutboxAndHints(ctx, normalized, destinations, analysisIdentityHints(rawEvt, decRec))
 		}
 		if storeErr != nil {
-			if !p.persistQuarantine(ctx, model.QuarantineEntry{RawID: rawEvt.RawID, RecordOrdinal: decRec.RecordOrdinal, RawSHA256: rawEvt.RawSHA256, Stage: "storage", Reason: "store_error", ErrorDetails: storeErr.Error(), RawPreview: childPreview, ReplayEligible: true, QuarantinedAt: time.Now().UTC()}) {
+			if !p.persistQuarantine(ctx, model.QuarantineEntry{RawID: rawEvt.RawID, RecordOrdinal: decRec.RecordOrdinal, RawSHA256: rawEvt.RawSHA256, Stage: "storage", Reason: "store_error", ErrorDetails: storeErr.Error(), RawPreview: childPreview, ReplayEligible: true, QuarantinedAt: time.Now().UTC(), AnalysisHints: analysisIdentityHints(rawEvt, decRec)}) {
 				unresolvedChild = true
 			}
 			continue
@@ -603,7 +631,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec model.IngestedRecord) 
 					unresolvedChild = true
 					continue
 				}
-				if !p.persistQuarantine(ctx, model.QuarantineEntry{RawID: rawEvt.RawID, RecordOrdinal: decRec.RecordOrdinal, RawSHA256: rawEvt.RawSHA256, Stage: "output", Reason: "sink_error", ErrorDetails: emitErr.Error(), RawPreview: childPreview, ReplayEligible: true, QuarantinedAt: time.Now().UTC()}) {
+				if !p.persistQuarantine(ctx, model.QuarantineEntry{RawID: rawEvt.RawID, RecordOrdinal: decRec.RecordOrdinal, RawSHA256: rawEvt.RawSHA256, Stage: "output", Reason: "sink_error", ErrorDetails: emitErr.Error(), RawPreview: childPreview, ReplayEligible: true, QuarantinedAt: time.Now().UTC(), AnalysisHints: analysisIdentityHints(rawEvt, decRec)}) {
 					unresolvedChild = true
 				}
 				continue
@@ -799,7 +827,7 @@ func (p *Pipeline) ReplayWithOperation(ctx context.Context, qID, operationID str
 	}
 	// Resolve quarantine and store delivery intent in one database transaction.
 	if p.store != nil {
-		if err := p.store.ResolveQuarantineWithOutboxOperation(ctx, qID, norm, destinations, returnedOperationID); err != nil {
+		if err := p.store.ResolveQuarantineWithOutboxOperationAndHints(ctx, qID, norm, destinations, returnedOperationID, analysisIdentityHints(rawEvt, decRec)); err != nil {
 			if committed, lookupErr := p.store.BeginReplay(ctx, qID, returnedOperationID); lookupErr == nil && committed.State == "completed" {
 				var saved model.NormalizedEvent
 				if decodeErr := json.Unmarshal(committed.ResultJSON, &saved); decodeErr == nil {

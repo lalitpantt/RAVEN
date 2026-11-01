@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RAVEN Analysis Device",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "raven.io/v1" },
+    "kind": { "const": "Device" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": {
+      "type": "object",
+      "required": ["displayName", "sourceCategory", "aliases"],
+      "additionalProperties": false,
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sourceCategory": { "type": "string", "enum": ["network_device", "server", "os", "endpoint", "application", "database", "cloud", "container", "iam", "iot", "other"] },
+        "aliases": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": false,
+          "properties": {
+            "syslog_host": { "$ref": "#/$defs/aliases" },
+            "host": { "$ref": "#/$defs/aliases" },
+            "server": { "$ref": "#/$defs/aliases" },
+            "source_ip": { "$ref": "#/$defs/aliases" }
+          }
+        },
+        "labels": { "type": "object", "maxProperties": 64, "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]*$" }, "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 128 } },
+        "enabled": { "type": "boolean", "default": true },
+        "reporting": { "$ref": "#/$defs/reporting" },
+        "maintenance": { "$ref": "#/$defs/maintenance" }
+      }
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "version": { "type": "string", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$" },
+        "description": { "type": "string", "maxLength": 1024 }
+      }
+    },
+    "aliases": { "type": "array", "minItems": 1, "maxItems": 32, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^\\S(?:.*\\S)?$" } },
+    "duration": { "type": "string", "minLength": 2, "maxLength": 64 },
+    "reporting": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "type": "string", "enum": ["event", "heartbeat"], "default": "event" },
+        "heartbeatRule": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "expectedInterval": { "$ref": "#/$defs/duration" },
+        "warningAfter": { "$ref": "#/$defs/duration" },
+        "criticalAfter": { "$ref": "#/$defs/duration" },
+        "freshnessAfter": { "$ref": "#/$defs/duration" }
+      }
+    },
+    "maintenance": {
+      "type": "object",
+      "required": ["timeZone", "windows"],
+      "additionalProperties": false,
+      "properties": {
+        "timeZone": { "type": "string", "minLength": 1 },
+        "windows": { "type": "array", "maxItems": 64, "items": { "type": "object", "required": ["weekdays", "start", "end"], "additionalProperties": false, "properties": { "weekdays": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] } }, "start": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }, "end": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" } } } }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["spec"],
+        "properties": {
+          "spec": {
+            "required": ["reporting"],
+            "properties": {
+              "reporting": {
+                "required": ["mode"],
+                "properties": { "mode": { "const": "heartbeat" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "reporting": {
+                "required": ["heartbeatRule", "expectedInterval", "warningAfter", "criticalAfter"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["spec"],
+        "properties": {
+          "spec": {
+            "required": ["reporting"],
+            "properties": {
+              "reporting": {
+                "required": ["mode"],
+                "properties": { "mode": { "const": "event" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "spec": {
+            "properties": {
+              "reporting": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["heartbeatRule"] },
+                    { "required": ["expectedInterval"] },
+                    { "required": ["warningAfter"] },
+                    { "required": ["criticalAfter"] }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

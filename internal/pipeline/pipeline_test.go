@@ -70,6 +70,32 @@ func TestReplayFailureAppendsEvidenceOnlyWhenIntegrityEnabled(t *testing.T) {
 	}
 }
 
+func TestPipelineAddsBoundedAnalysisIdentityHintsWithoutChangingEventEnvelope(t *testing.T) {
+	p, store, _ := setupTestPipeline(t, 1)
+	ctx := context.Background()
+	store.SetAnalysisEnabled(true)
+	if err := p.SubmitSync(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.20.0.9", RawBytes: []byte("<14>1 2026-10-31T23:59:00Z edge-09 app - - link up"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	observations, checkpoint, err := store.AnalysisBatch(ctx, 10)
+	if err != nil || checkpoint != 0 || len(observations) != 2 {
+		t.Fatalf("unexpected lifecycle observations: checkpoint=%d observations=%+v err=%v", checkpoint, observations, err)
+	}
+	if observations[0].Kind != "raw_received" || observations[0].IdentityHints["source_ip"] != "10.20.0.9" {
+		t.Fatalf("raw receipt hints missing: %+v", observations[0])
+	}
+	if observations[1].Kind != "normalized" || observations[1].IdentityHints["syslog_host"] != "edge-09" || observations[1].IdentityHints["source_ip"] != "10.20.0.9" {
+		t.Fatalf("normalized identity hints missing: %+v", observations[1])
+	}
+	events, total, err := store.ListNormalized(ctx, "", "", "", 10, 0)
+	if err != nil || total != 1 || len(events) != 1 {
+		t.Fatalf("normalized event missing: count=%d total=%d err=%v", len(events), total, err)
+	}
+	if events[0].Raven.SourceID != "10.20.0.9" || len(events[0].Raven.ProcessingHistory) == 0 {
+		t.Fatalf("existing event contract changed: %+v", events[0].Raven)
+	}
+}
+
 func TestReplayRejectsIneligibleAndMissingStoredChildOrdinal(t *testing.T) {
 	p, store, _ := setupTestPipeline(t, 1)
 	ctx := context.Background()

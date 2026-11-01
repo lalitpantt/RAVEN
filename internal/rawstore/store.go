@@ -23,20 +23,21 @@ import (
 
 // RawStore provides durable, cryptographically verified storage for raw byte streams.
 type RawStore struct {
-	db          *sql.DB
-	auditDB     *sql.DB
-	dbPath      string
-	writeMu     sync.Mutex
-	sealMu      sync.Mutex
-	sealCancel  context.CancelFunc
-	sealWG      sync.WaitGroup
-	witnessMu   sync.Mutex
-	witnessStop context.CancelFunc
-	witnessWG   sync.WaitGroup
-	auditMu     sync.Mutex
-	auditCancel context.CancelFunc
-	auditWG     sync.WaitGroup
-	counter     atomic.Uint64
+	db              *sql.DB
+	auditDB         *sql.DB
+	dbPath          string
+	writeMu         sync.Mutex
+	sealMu          sync.Mutex
+	sealCancel      context.CancelFunc
+	sealWG          sync.WaitGroup
+	witnessMu       sync.Mutex
+	witnessStop     context.CancelFunc
+	witnessWG       sync.WaitGroup
+	auditMu         sync.Mutex
+	auditCancel     context.CancelFunc
+	auditWG         sync.WaitGroup
+	counter         atomic.Uint64
+	analysisEnabled atomic.Bool
 }
 
 // New opens an SQLite database, creates required tables and enables WAL mode.
@@ -92,7 +93,7 @@ func New(dbPath string) (*RawStore, error) {
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 7
+const CurrentSchemaVersion = 8
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -376,6 +377,55 @@ func migrateSchema(db sqlExecutor) error {
 		version = 7
 	}
 
+	if version < 8 {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS analysis_observations (
+			observation_id INTEGER PRIMARY KEY,
+			observation_key TEXT NOT NULL UNIQUE,
+			kind TEXT NOT NULL CHECK(kind IN ('raw_received','normalized','quarantined')),
+			occurred_at TEXT NOT NULL,
+			raw_id TEXT NOT NULL,
+			event_id TEXT,
+			quarantine_id TEXT,
+			record_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(record_ordinal BETWEEN 0 AND 2147483647),
+			transport TEXT NOT NULL,
+			identity_hints_json TEXT NOT NULL CHECK(length(identity_hints_json)<=2048),
+			FOREIGN KEY(raw_id) REFERENCES raw_events(raw_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_observations_raw ON analysis_observations(raw_id,observation_id);
+		CREATE TABLE IF NOT EXISTS analysis_worker_state (
+			singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+			checkpoint_id INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_id>=0),
+			updated_at TEXT NOT NULL
+		);
+		INSERT OR IGNORE INTO analysis_worker_state(singleton,checkpoint_id,updated_at) VALUES(1,0,'1970-01-01T00:00:00Z');
+		CREATE TABLE IF NOT EXISTS analysis_sources (
+			source_key TEXT PRIMARY KEY CHECK(length(source_key)=64),
+			identity_hints_json TEXT NOT NULL CHECK(length(identity_hints_json)<=2048),
+			resolution TEXT NOT NULL CHECK(resolution IN ('matched','unknown','ambiguous')),
+			device_id TEXT,
+			match_method TEXT NOT NULL,
+			confidence TEXT NOT NULL CHECK(confidence IN ('strong','weak','none')),
+			first_seen_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			observation_count INTEGER NOT NULL CHECK(observation_count>0),
+			last_observation_id INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_sources_resolution ON analysis_sources(resolution,last_seen_at);
+		CREATE TABLE IF NOT EXISTS analysis_observation_sources (
+			observation_id INTEGER PRIMARY KEY,
+			source_key TEXT NOT NULL,
+			resolution TEXT NOT NULL CHECK(resolution IN ('matched','unknown','ambiguous')),
+			device_id TEXT,
+			match_method TEXT NOT NULL,
+			confidence TEXT NOT NULL CHECK(confidence IN ('strong','weak','none')),
+			FOREIGN KEY(observation_id) REFERENCES analysis_observations(observation_id),
+			FOREIGN KEY(source_key) REFERENCES analysis_sources(source_key)
+		);`); err != nil {
+			return fmt.Errorf("failed to create analysis observation schema v8: %w", err)
+		}
+		version = 8
+	}
+
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {
 		return fmt.Errorf("failed to set user_version: %w", err)
 	}
@@ -482,6 +532,11 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 			contentSnapshot: []byte{}, contentBytes: event.Payload, metadataFields: metadataFields,
 		}); err != nil {
 			return nil, fmt.Errorf("failed to append raw commit evidence: %w", err)
+		}
+	}
+	if s.analysisEnabled.Load() {
+		if err := appendAnalysisObservationTx(ctx, tx, "raw_received", "raw:"+event.RawID, event.ReceivedAt, event.RawID, "", "", 0, event.Transport, model.AnalysisIdentityHints{"source_ip": event.SourceIP}); err != nil {
+			return nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -689,6 +744,19 @@ func (s *RawStore) quarantine(ctx context.Context, entry model.QuarantineEntry, 
 	if finalize {
 		if _, err := tx.ExecContext(ctx, `UPDATE raw_events SET status = ? WHERE raw_id = ?`, string(model.StatusQuarantined), entry.RawID); err != nil {
 			return fmt.Errorf("failed to update raw event status to quarantined: %w", err)
+		}
+	}
+	if s.analysisEnabled.Load() {
+		var persistedID, transport, sourceIP string
+		if err := tx.QueryRowContext(ctx, `SELECT q.quarantine_id,r.transport,r.source_ip FROM quarantine q JOIN raw_events r ON r.raw_id=q.raw_id WHERE q.raw_id=? AND q.record_ordinal=? AND q.stage=? AND q.reason=?`, entry.RawID, entry.RecordOrdinal, entry.Stage, entry.Reason).Scan(&persistedID, &transport, &sourceIP); err != nil {
+			return fmt.Errorf("load committed quarantine for analysis observation: %w", err)
+		}
+		hints := model.AnalysisIdentityHints{"source_ip": sourceIP}
+		for key, value := range entry.AnalysisHints {
+			hints[key] = value
+		}
+		if err := appendAnalysisObservationTx(ctx, tx, "quarantined", "quarantined:"+persistedID, entry.QuarantinedAt, entry.RawID, "", persistedID, entry.RecordOrdinal, transport, hints); err != nil {
+			return err
 		}
 	}
 
@@ -1054,6 +1122,13 @@ func (s *RawStore) DeleteNormalizedChild(ctx context.Context, rawID string, ordi
 
 // StoreNormalizedWithOutbox atomically stores the projection and one idempotent delivery row per destination.
 func (s *RawStore) StoreNormalizedWithOutbox(ctx context.Context, event *model.NormalizedEvent, destinations []string) error {
+	hints := model.AnalysisIdentityHints{"host": event.Raven.SourceID}
+	return s.StoreNormalizedWithOutboxAndHints(ctx, event, destinations, hints)
+}
+
+// StoreNormalizedWithOutboxAndHints atomically persists normalized output,
+// delivery intent, and the bounded Analysis observation when Analysis is enabled.
+func (s *RawStore) StoreNormalizedWithOutboxAndHints(ctx context.Context, event *model.NormalizedEvent, destinations []string, hints model.AnalysisIdentityHints) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1063,6 +1138,16 @@ func (s *RawStore) StoreNormalizedWithOutbox(ctx context.Context, event *model.N
 	defer tx.Rollback()
 	if err := storeNormalizedTx(ctx, tx, event, destinations); err != nil {
 		return err
+	}
+	if s.analysisEnabled.Load() {
+		var transport, sourceIP string
+		if err := tx.QueryRowContext(ctx, `SELECT transport,source_ip FROM raw_events WHERE raw_id=?`, event.Raven.RawID).Scan(&transport, &sourceIP); err != nil {
+			return fmt.Errorf("load raw source for analysis observation: %w", err)
+		}
+		hints = addSourceIP(hints, sourceIP)
+		if err := appendAnalysisObservationTx(ctx, tx, "normalized", "normalized:"+event.Raven.EventID, time.Now().UTC(), event.Raven.RawID, event.Raven.EventID, "", event.Raven.RecordOrdinal, transport, hints); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -1084,6 +1169,11 @@ func (s *RawStore) ResolveQuarantineWithOutbox(ctx context.Context, qID string, 
 }
 
 func (s *RawStore) ResolveQuarantineWithOutboxOperation(ctx context.Context, qID string, event *model.NormalizedEvent, destinations []string, opID string) error {
+	hints := model.AnalysisIdentityHints{"host": event.Raven.SourceID}
+	return s.ResolveQuarantineWithOutboxOperationAndHints(ctx, qID, event, destinations, opID, hints)
+}
+
+func (s *RawStore) ResolveQuarantineWithOutboxOperationAndHints(ctx context.Context, qID string, event *model.NormalizedEvent, destinations []string, opID string, hints model.AnalysisIdentityHints) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1117,6 +1207,16 @@ func (s *RawStore) ResolveQuarantineWithOutboxOperation(ctx context.Context, qID
 	}
 	if err := storeNormalizedTx(ctx, tx, event, destinations); err != nil {
 		return err
+	}
+	if s.analysisEnabled.Load() {
+		var transport, sourceIP string
+		if err := tx.QueryRowContext(ctx, `SELECT transport,source_ip FROM raw_events WHERE raw_id=?`, event.Raven.RawID).Scan(&transport, &sourceIP); err != nil {
+			return fmt.Errorf("load replay source for analysis observation: %w", err)
+		}
+		hints = addSourceIP(hints, sourceIP)
+		if err := appendAnalysisObservationTx(ctx, tx, "normalized", "normalized:"+event.Raven.EventID, time.Now().UTC(), event.Raven.RawID, event.Raven.EventID, "", event.Raven.RecordOrdinal, transport, hints); err != nil {
+			return err
+		}
 	}
 	var normalizedSeq any
 	if enabled {

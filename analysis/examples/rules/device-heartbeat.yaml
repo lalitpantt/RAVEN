@@ -1,0 +1,17 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: device-heartbeat
+  version: 1.0.0
+  description: Recognize the configured periodic device heartbeat event
+spec:
+  kind: heartbeat
+  match:
+    fields:
+      - path: activity_name
+        op: eq
+        value: heartbeat
+  finding:
+    severity: medium
+    state: yellow
+    title: Device heartbeat is late

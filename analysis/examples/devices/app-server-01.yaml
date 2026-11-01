@@ -1,0 +1,20 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: app-server-01
+  version: 1.0.0
+  description: Application server
+spec:
+  displayName: Application Server 01
+  sourceCategory: server
+  aliases:
+    host:
+      - app-server-01
+    server:
+      - app-server-01.example.internal
+  labels:
+    site: hq
+    service: payments
+  reporting:
+    mode: event
+    freshnessAfter: 15m

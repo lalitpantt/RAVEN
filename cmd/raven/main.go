@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"raven/internal/analysis"
 	"raven/internal/api"
 	"raven/internal/cli"
 	"raven/internal/connections"
@@ -61,6 +62,12 @@ func main() {
 	if len(os.Args) > 1 {
 		cmd := os.Args[1]
 		switch cmd {
+		case "analysis":
+			code := cli.RunAnalysisCLI(os.Args[2:], os.Stdout, os.Stderr)
+			if code != 0 {
+				os.Exit(code)
+			}
+			return
 		case "stop", "-stop", "--stop":
 			cli.StopDaemon(cli.DefaultPIDFile)
 			return
@@ -363,6 +370,7 @@ func main() {
 	}
 
 	dbPath := flag.String("db", "data/raven.db", "Path to SQLite raw store database")
+	analysisDir := flag.String("analysis-dir", "analysis", "Path to Analysis inventory and rules ('none' disables Analysis)")
 	integrityStreamID := flag.String("integrity-stream-id", os.Getenv("RAVEN_STREAM_ID"), "Opt in to evidence integrity with a 32-byte hex stream ID")
 	integrityEpoch := flag.String("integrity-installation-epoch", os.Getenv("RAVEN_INSTALLATION_EPOCH"), "32-byte hex installation epoch for a new integrity stream")
 	packsDir := flag.String("packs-dir", "packs", "Path to YAML parser packs directory")
@@ -447,6 +455,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	var analysisSnapshot *analysis.Snapshot
+	if *analysisDir != "none" {
+		analysisSnapshot, err = analysis.LoadDirectory(*analysisDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: Analysis configuration disabled: %v\n", err)
+			analysisSnapshot = nil
+		} else if analysisSnapshot.Enabled() {
+			fmt.Fprintf(os.Stderr, " Loaded Analysis config: %d device(s), %d rule(s) from %s\n", analysisSnapshot.DeviceCount(), analysisSnapshot.RuleCount(), *analysisDir)
+		}
+	}
 	if *integrityStreamID != "" || *integrityEpoch != "" {
 		streamID, parseErr := parseIntegrityHash(*integrityStreamID)
 		if parseErr == nil {
@@ -579,6 +597,17 @@ func main() {
 		BufferSize:  2000,
 		PackManager: packManager,
 	}, store, compositeSink)
+	var analysisWorker *analysis.Worker
+	if analysisSnapshot != nil && analysisSnapshot.Enabled() {
+		analysisWorker, err = analysis.NewWorker(store, analysisSnapshot.Resolver())
+		if err == nil {
+			err = analysisWorker.Start(context.Background())
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: Analysis worker disabled: %v\n", err)
+			analysisWorker = nil
+		}
+	}
 	p.Start()
 
 	// 4. Initialize Ingestion Adapters
@@ -802,6 +831,9 @@ func main() {
 	cancel()
 	_ = mgr.Stop()
 	p.Stop()
+	if analysisWorker != nil {
+		analysisWorker.Stop()
+	}
 	_ = compositeSink.Flush()
 	_ = compositeSink.Close()
 
