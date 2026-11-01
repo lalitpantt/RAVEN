@@ -101,7 +101,7 @@ native_up() {
   fi
   if [[ ! -f "$LAB/raven.pid" ]] || ! kill -0 "$(cat "$LAB/raven.pid")" 2>/dev/null; then
     mkdir -p "$LAB/raven/inbox" "$LAB/raven/output"
-    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; export RAVEN_WITNESS_URL=http://127.0.0.1:19091 RAVEN_WITNESS_PUBLIC_KEY="$LAB/witness/receipt-key.pub"; exec "$LAB/bin/raven" -db "$LAB/raven/raven.db" -inbox "$LAB/raven/inbox" -output-file "$LAB/raven/output/normalized.ndjson" -syslog-udp none -syslog-tcp none -http 127.0.0.1:18080 -ui 127.0.0.1:19090) > "$LAB/raven/raven.log" 2>&1 & echo $! > "$LAB/raven.pid"
+    (cd "$ROOT"; set -a; source "$LAB/lab.env"; set +a; export RAVEN_WITNESS_URL=http://127.0.0.1:19091 RAVEN_WITNESS_PUBLIC_KEY="$LAB/witness/receipt-key.pub"; exec "$LAB/bin/raven" -db "$LAB/raven/raven.db" -analysis-dir "$ROOT/analysis/demo" -inbox "$LAB/raven/inbox" -output-file "$LAB/raven/output/normalized.ndjson" -syslog-udp none -syslog-tcp none -http 127.0.0.1:18080 -ui 127.0.0.1:19090) > "$LAB/raven/raven.log" 2>&1 & echo $! > "$LAB/raven.pid"
   fi
   for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1 && break; sleep 1; done
   curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null || fail "RAVEN failed; inspect $LAB/raven/raven.log"
@@ -110,6 +110,7 @@ native_up() {
   curl -fsS -H "Authorization: Bearer $RAVEN_WITNESS_ADMIN_TOKEN" "http://127.0.0.1:19091/v1/streams/0x$RAVEN_STREAM_ID/status" >/dev/null || fail "witness failed; inspect $LAB/witness/witness.log"
   for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:19090/api/v1/integrity/status 2>/dev/null | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null && break; sleep 1; done
   curl -fsS http://127.0.0.1:19090/api/v1/integrity/status | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null || fail "RAVEN integrity stream differs from the isolated lab configuration"
+  curl -fsS http://127.0.0.1:19090/api/v1/analysis/status | jq -e '.enabled == true and .device_count == 6 and .rule_count == 5' >/dev/null || fail "RAVEN Analysis demo is not active; stop and restart the lab after updating its configuration"
 }
 stop() {
   if [[ -f "$LAB/compose-active" ]]; then
@@ -140,8 +141,13 @@ case "${1:-help}" in
     for _ in $(seq 1 60); do cast chain-id --rpc-url http://127.0.0.1:18545 >/dev/null 2>&1 && break; sleep 1; done
     deploy http://127.0.0.1:18545
     (cd "$ROOT/web" && npm ci && npm run build)
-    docker compose --env-file "$LAB/lab.env" -p raven-blockchain-dev -f "$ROOT/docker-compose.blockchain.yaml" up -d --build witness raven ;;
-  status) curl -fsS http://127.0.0.1:18080/api/v1/health; echo; curl -fsS http://127.0.0.1:19090/api/v1/integrity/status; echo ;;
+    docker compose --env-file "$LAB/lab.env" -p raven-blockchain-dev -f "$ROOT/docker-compose.blockchain.yaml" up -d --build witness raven
+    set -a; source "$LAB/lab.env"; set +a
+    for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1 && break; sleep 1; done
+    curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null || fail "RAVEN failed; inspect Compose logs"
+    curl -fsS http://127.0.0.1:19090/api/v1/integrity/status | jq -e --arg id "0x$RAVEN_STREAM_ID" '.stream_id == $id' >/dev/null || fail "RAVEN integrity stream differs from the isolated lab configuration"
+    curl -fsS http://127.0.0.1:19090/api/v1/analysis/status | jq -e '.enabled == true and .device_count == 6 and .rule_count == 5' >/dev/null || fail "RAVEN Analysis demo is not active in the Compose image" ;;
+  status) curl -fsS http://127.0.0.1:18080/api/v1/health; echo; curl -fsS http://127.0.0.1:19090/api/v1/integrity/status; echo; curl -fsS http://127.0.0.1:19090/api/v1/analysis/status; echo ;;
   stop) stop ;;
   reset) [[ "${2:-}" == --yes ]] || fail "usage: $0 reset --yes (removes only $LAB)"; [[ "$LAB" == "$ROOT/data/blockchain-dev" && ! -L "$LAB" ]] || fail "refusing unsafe reset"; stop; rm -rf -- "$LAB"; echo "Removed $LAB" ;;
   benchmark)
@@ -151,7 +157,7 @@ case "${1:-help}" in
     (while kill -0 "$raven_pid" 2>/dev/null; do ps -o rss= -p "$raven_pid" 2>/dev/null | awk 'NF {print $1}'; sleep 0.1; done) >> "$LAB/rss-samples-kb.txt" & sampler=$!
     started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"; per_job=$((count / 4)); extra=$((count % 4)); pids=()
     for job in 1 2 3 4; do job_count="$per_job"; [[ "$job" -le "$extra" ]] && job_count=$((job_count + 1)); [[ "$job_count" -gt 0 ]] || continue
-      "$LAB/bin/logsim" --source app --scenario mixed --format http-post --target http://127.0.0.1:18080/api/v1/ingest --rate 0 --count "$job_count" --seed "$job" > "$LAB/logsim-$job.log" 2>&1 & pids+=("$!")
+      "$LAB/bin/logsim" --source all --scenario mixed --format http-post --target http://127.0.0.1:18080/api/v1/ingest --rate 0 --count "$job_count" --seed "$job" > "$LAB/logsim-$job.log" 2>&1 & pids+=("$!")
     done
     for pid in "${pids[@]}"; do wait "$pid" || fail "a concurrent synthetic producer failed; inspect $LAB/logsim-*.log"; done
     ingest_done_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
@@ -172,7 +178,7 @@ case "${1:-help}" in
     throughput="$(awk -v n="$count" -v ms="$ingest_ms" 'BEGIN { printf "%.3f", n*1000/(ms>0?ms:1) }')"
     printf '{"events":%s,"concurrent_producers":4,"ingest_seconds":%.3f,"events_per_second":%s,"max_raven_rss_kb":%s,"sqlite_bytes":%s,"wal_bytes":%s,"backlog_catchup_seconds":%.3f,"fast_audit_seconds":%.3f}\n' "$count" "$(awk -v ms="$ingest_ms" 'BEGIN { printf "%.3f", ms/1000 }')" "$throughput" "$max_rss_kb" "$db" "$wal" "$(awk -v ms="$catchup_ms" 'BEGIN { printf "%.3f", ms/1000 }')" "$(awk -v ms="$audit_ms" 'BEGIN { printf "%.3f", ms/1000 }')" | tee -a "$LAB/benchmark.jsonl" ;;
   test)
-    (cd "$ROOT" && npm run build --prefix web && go test ./... && go vet ./... && go test -tags blockchain_integration ./internal/witness -run TestAnchorerAnvilRecoveryAndResetDetection -count=1)
+    (cd "$ROOT" && npm run build --prefix web && go test ./... && go vet ./... && go run ./cmd/raven analysis validate --analysis-dir analysis/demo && go test -tags blockchain_integration ./internal/witness -run TestAnchorerAnvilRecoveryAndResetDetection -count=1)
     (cd "$ROOT/contracts" && forge build && forge test)
     docker compose -f "$ROOT/docker-compose.blockchain.yaml" config --quiet
     bash -n "$0" ;;

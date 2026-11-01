@@ -140,6 +140,8 @@ func (s *AppSimulator) Generate(scenario string, ts time.Time, rng *rand.Rand) [
 	clientIP := fmt.Sprintf("10.0.1.%d", 50+rng.Intn(6))
 
 	switch scenario {
+	case "heartbeat":
+		return []byte(fmt.Sprintf(`{"timestamp":"%s","level":"INFO","service":"payment-gateway","trace_id":"%s","user_id":"system","action":"heartbeat","amount":0,"currency":"INR","status":"success","error_code":null,"message":"Simulator heartbeat","client_ip":"10.0.1.1","server":"pay-srv-heartbeat-01","response_time_ms":0}`, timeStr, traceID))
 	case "scan", "error":
 		return []byte(fmt.Sprintf(`{"timestamp":"%s","level":"ERROR","service":"payment-gateway","trace_id":"%s","user_id":"%s","action":"payment_process","amount":%.2f,"currency":"INR","status":"failed","error_code":"PG_TIMEOUT","message":"Payment gateway timeout after 30s","client_ip":"%s","server":"pay-srv-02","response_time_ms":30000}`, timeStr, traceID, userID, 15000.0, clientIP))
 	case "malformed":
@@ -179,7 +181,7 @@ func (s *DatabaseSimulator) Generate(scenario string, ts time.Time, rng *rand.Ra
 
 func main() {
 	sourceFlag := flag.String("source", "all", "Source: firewall|asa|sshd|ids|webserver|app|database|all|mixed")
-	scenarioFlag := flag.String("scenario", "all", "Scenario: normal|bruteforce|scan|malformed|mixed|all")
+	scenarioFlag := flag.String("scenario", "all", "Scenario: normal|bruteforce|scan|malformed|heartbeat|mixed|all")
 	formatFlag := flag.String("format", "stdout", "Output format: stdout|syslog-udp|syslog-tcp|syslog-tls|http-post|file")
 	targetFlag := flag.String("target", "127.0.0.1:514", "Network target address or URL (e.g. 127.0.0.1:514 or http://127.0.0.1:8080/api/v1/ingest)")
 	outputDir := flag.String("output-dir", "simulated", "Output directory when format=file")

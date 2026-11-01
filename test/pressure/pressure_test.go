@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"raven/internal/analysis"
 	"raven/internal/model"
 	"raven/internal/pipeline"
 	"raven/internal/rawstore"
@@ -217,6 +218,83 @@ func TestPressureProfiles(t *testing.T) {
 	}
 	if atomic.LoadInt64(&sink.delivered) < int64(stats.Normalized) {
 		t.Errorf("sink received fewer than normalized: %d vs %d", sink.delivered, stats.Normalized)
+	}
+}
+
+func TestAnalysisPressureGate(t *testing.T) {
+	if os.Getenv("RAVEN_ANALYSIS_PRESSURE_GATE") != "1" {
+		t.Skip("set RAVEN_ANALYSIS_PRESSURE_GATE=1 to run the Analysis release pressure gate")
+	}
+	type result struct {
+		eps, p95Micros float64
+	}
+	run := func(enabled bool) result {
+		t.Helper()
+		tracker := &LatencyTracker{}
+		dir := t.TempDir()
+		store, err := rawstore.New(filepath.Join(dir, "analysis-pressure.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		var worker *analysis.Worker
+		if enabled {
+			worker, err = analysis.NewWorker(store, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := worker.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Stop()
+		}
+		sink := &BenchSink{tracker: tracker}
+		p := pipeline.New(pipeline.Config{Workers: 8, BufferSize: 50000}, store, sink)
+		p.Start()
+		const events = 1000
+		started := time.Now()
+		for i := 0; i < events; i++ {
+			if err := p.SubmitSync(context.Background(), model.IngestedRecord{
+				Transport: "http_post", SourceIP: "10.0.1.1", RawBytes: sampleWorkload[i%len(sampleWorkload)], ReceivedAt: time.Now().UTC(),
+			}); err != nil {
+				t.Fatalf("analysis enabled=%t submit %d: %v", enabled, i, err)
+			}
+		}
+		eps := float64(events) / time.Since(started).Seconds()
+		p.Stop()
+		if stats := p.Stats(); stats.Accepted != events {
+			t.Fatalf("analysis enabled=%t accepted=%d, want %d", enabled, stats.Accepted, events)
+		} else if ok, reason := stats.VerifyInvariant(); !ok {
+			t.Fatalf("analysis enabled=%t loss accounting: %s", enabled, reason)
+		}
+		_, p95, _, _, _ := tracker.Percentiles()
+		if enabled {
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				status, err := worker.Status(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status.QueueStatus.Pending == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("analysis queue did not drain within five seconds: %+v", status.QueueStatus)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		return result{eps: eps, p95Micros: float64(p95.Microseconds())}
+	}
+
+	baseline := run(false)
+	withAnalysis := run(true)
+	t.Logf("1,000 mixed events: disabled %.1f EPS / %.0f µs p95; enabled %.1f EPS / %.0f µs p95", baseline.eps, baseline.p95Micros, withAnalysis.eps, withAnalysis.p95Micros)
+	if withAnalysis.eps < baseline.eps*0.90 {
+		t.Fatalf("analysis throughput %.1f EPS fell below 90%% of disabled %.1f EPS", withAnalysis.eps, baseline.eps)
+	}
+	if baseline.p95Micros > 0 && withAnalysis.p95Micros > baseline.p95Micros*1.25 {
+		t.Fatalf("analysis p95 %.0f µs exceeded 125%% of disabled %.0f µs", withAnalysis.p95Micros, baseline.p95Micros)
 	}
 }
 

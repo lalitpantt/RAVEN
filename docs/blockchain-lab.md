@@ -20,7 +20,9 @@ scripts/run-blockchain-dev.sh benchmark 1000
 scripts/run-blockchain-dev.sh stop
 ```
 
-`init` creates random stream/epoch IDs, independent Raven and witness credentials, and a one-time Ed25519 receipt key. `native-up` starts Anvil only on loopback, deploys/registers the stream on first run, pins the chain/deployment/code identity in `deployment.json`, builds the UI and local binaries, then starts the witness and RAVEN against lab-only databases. It refuses to silently repin a changed Anvil genesis or a missing pinned contract. Use `reset --yes` only when deliberately discarding this lab and its state.
+`init` creates random stream/epoch IDs, independent Raven and witness credentials, and a one-time Ed25519 receipt key. `native-up` starts Anvil only on loopback, deploys/registers the stream on first run, pins the chain/deployment/code identity in `deployment.json`, builds the UI and local binaries, then starts the witness and RAVEN against lab-only databases. It starts RAVEN with the six-device/five-rule demo in `analysis/demo/` and verifies that Analysis is active. The Analysis dashboard is at `http://127.0.0.1:19090` under **Analysis**; `status` prints its worker/config state as well as health and integrity. It refuses to silently repin a changed Anvil genesis or a missing pinned contract. Use `reset --yes` only when deliberately discarding this lab and its state.
+
+The demo inventory and rules produce green device health from normalized logs, a red heartbeat timeout after the one-shot heartbeat stops, red firewall findings, yellow SSH/quarantine findings, a grey disabled spare, and unknown unassigned sources. Seed and continuous all-source Docker simulator commands are in [the Analysis demo runbook](../plans/final-run.md#analysis-demo-with-the-blockchain-lab). The heartbeat scenario is excluded from mixed traffic so the deadline transition remains observable.
 
 The local Raven UI is at `http://127.0.0.1:19090`; HTTP ingest is `http://127.0.0.1:18080/api/v1/ingest`. The witness is bound to `127.0.0.1:19091`. The development Anvil account private key is public and disposable; never reuse it outside this local simulation.
 
@@ -38,7 +40,7 @@ This uses only `docker-compose.blockchain.yaml` and Compose project `raven-block
 
 ## Checks and measurements
 
-`scripts/run-blockchain-dev.sh test` runs Go tests and vet, the UI production build, Forge build/tests, and the runner shell parser. The tagged live Anvil recovery test is separate:
+`scripts/run-blockchain-dev.sh test` runs Go tests and vet, the UI production build, demo Analysis YAML validation, the tagged live Anvil recovery test, Forge build/tests, Compose config parsing, and the runner shell parser. The tagged test exercises recovery and reset detection:
 
 ```sh
 GOCACHE=/private/tmp/raven-gocache go test -tags blockchain_integration ./internal/witness -run TestAnchorerAnvilRecoveryAndResetDetection -count=1
