@@ -3,6 +3,7 @@ import { NormalizedEvent, EventTrace, QuarantineEntry, SourceSummary } from '../
 import { ParserPackSummary, PackValidationResponse, MarketplacePack } from '../types/pack';
 import { RuntimeConfig } from '../types/config';
 import { ConnectionSummary, ConnectionValidationResponse, ConnectionTestResponse, ConnectionApplyResponse } from '../types/connection';
+import { AnalysisDevice, AnalysisFinding, AnalysisFindingDetail, AnalysisSource, AnalysisStatus } from '../types/analysis';
 
 const BASE_URL = '/api/v1';
 
@@ -44,6 +45,14 @@ async function fetchText(endpoint: string, options?: RequestInit): Promise<strin
   return res.text();
 }
 
+function analysisQuery(params: Record<string, string | number | undefined>): string {
+  const query = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== '') query.set(key, String(value));
+  });
+  return query.toString();
+}
+
 export const apiService = {
   integrityStatus: () => fetchJSON<{
     enabled: boolean; stream_id: string | null;
@@ -59,6 +68,16 @@ export const apiService = {
   getIntegrityProof: (seq:string) => fetchJSON<any>(`/integrity/proofs/${encodeURIComponent(seq)}`),
   getHealth: () => fetchJSON<HealthStatus>('/health'),
   getStats: () => fetchJSON<SystemStats>('/stats'),
+
+  getAnalysisStatus: () => fetchJSON<AnalysisStatus>('/analysis/status'),
+  listAnalysisDevices: (params: { state?: string; category?: string; site?: string; device?: string; window?: string; limit?: number; offset?: number } = {}) =>
+    fetchJSON<{ devices: AnalysisDevice[]; total: number; limit: number; offset: number }>(`/analysis/devices?${analysisQuery(params)}`),
+  listAnalysisSources: (params: { resolution?: string; limit?: number; offset?: number } = {}) =>
+    fetchJSON<{ sources: AnalysisSource[]; resolution: string; total: number; limit: number; offset: number }>(`/analysis/sources?${analysisQuery(params)}`),
+  listAnalysisFindings: (params: { status?: string; rule_id?: string; device?: string; window?: string; limit?: number; offset?: number } = {}) =>
+    fetchJSON<{ findings: AnalysisFinding[]; status: string; total: number; limit: number; offset: number }>(`/analysis/findings?${analysisQuery(params)}`),
+  getAnalysisFinding: (id: string, limit = 50, offset = 0) =>
+    fetchJSON<AnalysisFindingDetail>(`/analysis/findings/${encodeURIComponent(id)}?limit=${limit}&offset=${offset}`),
   
   listEvents: (params?: { category?: string; severity?: string; q?: string; limit?: number; offset?: number }) => {
     const q = new URLSearchParams();

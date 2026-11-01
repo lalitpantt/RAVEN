@@ -205,6 +205,17 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	if !strings.Contains(first.Body.String(), `"device_id":"edge-router-01"`) || !strings.Contains(first.Body.String(), `"state":"green"`) || !strings.Contains(first.Body.String(), `"heartbeat_count":1`) || !strings.Contains(first.Body.String(), `"normalized_per_minute":0.4`) {
 		t.Fatalf("heartbeat device projection: %s", first.Body.String())
 	}
+	filteredDevices := request("/api/v1/analysis/devices?state=green&category=network_device&site=hq&device=router&window=1h")
+	if filteredDevices.Code != http.StatusOK || !strings.Contains(filteredDevices.Body.String(), `"total":1`) || !strings.Contains(filteredDevices.Body.String(), `"active_finding_count":1`) || !strings.Contains(filteredDevices.Body.String(), `"labels":{"criticality":"high","site":"hq"}`) {
+		t.Fatalf("server-filtered device response: %d %s", filteredDevices.Code, filteredDevices.Body.String())
+	}
+	filteredServer := request("/api/v1/analysis/devices?state=unknown&category=server&site=hq&device=app")
+	if filteredServer.Code != http.StatusOK || !strings.Contains(filteredServer.Body.String(), `"total":1`) || !strings.Contains(filteredServer.Body.String(), `"device_id":"app-server-01"`) {
+		t.Fatalf("configured device filter response: %d %s", filteredServer.Code, filteredServer.Body.String())
+	}
+	if invalid := request("/api/v1/analysis/devices?state=broken"); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid analysis state status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
 	unassigned := request("/api/v1/analysis/sources?resolution=unassigned&limit=10")
 	if unassigned.Code != http.StatusOK || !strings.Contains(unassigned.Body.String(), `"total":2`) || !strings.Contains(unassigned.Body.String(), `"resolution":"unknown"`) || !strings.Contains(unassigned.Body.String(), `"resolution":"ambiguous"`) {
 		t.Fatalf("unassigned sources response: %d %s", unassigned.Code, unassigned.Body.String())
@@ -215,6 +226,14 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	findings := request("/api/v1/analysis/findings?status=open")
 	if findings.Code != http.StatusOK || !strings.Contains(findings.Body.String(), `"rule_id":"interface-down"`) || !strings.Contains(findings.Body.String(), `"total":1`) {
 		t.Fatalf("read-only findings list: %d %s", findings.Code, findings.Body.String())
+	}
+	filteredFindings := request("/api/v1/analysis/findings?status=open&rule_id=interface-down&device=edge-router-01&window=1h")
+	if filteredFindings.Code != http.StatusOK || !strings.Contains(filteredFindings.Body.String(), `"total":1`) {
+		t.Fatalf("filtered findings response: %d %s", filteredFindings.Code, filteredFindings.Body.String())
+	}
+	noFindings := request("/api/v1/analysis/findings?status=open&device=missing-device")
+	if noFindings.Code != http.StatusOK || !strings.Contains(noFindings.Body.String(), `"total":0`) {
+		t.Fatalf("empty finding filter response: %d %s", noFindings.Code, noFindings.Body.String())
 	}
 	var findingResponse struct {
 		Findings []struct {

@@ -46,6 +46,11 @@ type AnalysisFinding struct {
 	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
+type AnalysisFindingFilter struct {
+	Status, RuleID, DeviceID string
+	Since                    *time.Time
+}
+
 type AnalysisFindingHistory struct {
 	ID            int64     `json:"id"`
 	FindingID     string    `json:"finding_id"`
@@ -341,12 +346,40 @@ func (s *RawStore) ResolveMaturedAnalysisFindings(ctx context.Context, now time.
 }
 
 func (s *RawStore) ListAnalysisFindings(ctx context.Context, status string, limit, offset int) ([]AnalysisFinding, int64, error) {
+	return s.ListAnalysisFindingsFiltered(ctx, AnalysisFindingFilter{Status: status}, limit, offset)
+}
+
+func (s *RawStore) ListAnalysisFindingsFiltered(ctx context.Context, filter AnalysisFindingFilter, limit, offset int) ([]AnalysisFinding, int64, error) {
 	if limit < 1 || limit > 500 || offset < 0 || offset > 1_000_000_000 {
 		return nil, 0, errors.New("invalid analysis finding pagination")
 	}
-	where, args, err := findingWhere(status)
+	where, args, err := findingWhere(filter.Status)
 	if err != nil {
 		return nil, 0, err
+	}
+	for _, condition := range []struct {
+		column string
+		value  string
+	}{{"rule_id", filter.RuleID}, {"device_id", filter.DeviceID}} {
+		if condition.value == "" {
+			continue
+		}
+		if where == "" {
+			where = " WHERE "
+		} else {
+			where += " AND "
+		}
+		where += condition.column + "=?"
+		args = append(args, condition.value)
+	}
+	if filter.Since != nil {
+		if where == "" {
+			where = " WHERE "
+		} else {
+			where += " AND "
+		}
+		where += "last_seen_at>=?"
+		args = append(args, filter.Since.UTC().Format(time.RFC3339Nano))
 	}
 	var total int64
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM analysis_findings"+where, args...).Scan(&total); err != nil {
@@ -366,6 +399,35 @@ func (s *RawStore) ListAnalysisFindings(ctx context.Context, status string, limi
 		items = append(items, f)
 	}
 	return items, total, rows.Err()
+}
+
+func (s *RawStore) CountActiveAnalysisFindingsByDevice(ctx context.Context, deviceIDs []string) (map[string]int64, error) {
+	counts := make(map[string]int64, len(deviceIDs))
+	if len(deviceIDs) == 0 {
+		return counts, nil
+	}
+	if len(deviceIDs) > 500 {
+		return nil, errors.New("analysis finding count query is limited to 500 devices")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(deviceIDs)), ",")
+	args := make([]any, len(deviceIDs))
+	for i, id := range deviceIDs {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT device_id,COUNT(*) FROM analysis_findings WHERE status IN ('open','clearing') AND device_id IN (`+placeholders+") GROUP BY device_id", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var count int64
+		if err := rows.Scan(&id, &count); err != nil {
+			return nil, err
+		}
+		counts[id] = count
+	}
+	return counts, rows.Err()
 }
 
 type rowScanner interface{ Scan(...any) error }

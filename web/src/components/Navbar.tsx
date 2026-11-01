@@ -31,6 +31,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const tabs = [
     { id: 'dashboard', label: 'Dashboard', icon: <Activity className="w-4 h-4 mr-1.5" /> },
+    { id: 'analysis', label: 'Analysis', icon: <Activity className="w-4 h-4 mr-1.5" /> },
     { id: 'events', label: 'Events Explorer', icon: <Terminal className="w-4 h-4 mr-1.5" /> },
     { id: 'quarantine', label: 'Quarantine DLQ', icon: <AlertTriangle className="w-4 h-4 mr-1.5" /> },
     { id: 'onboard', label: 'Pack Studio', icon: <FileCode2 className="w-4 h-4 mr-1.5" /> },
@@ -68,13 +69,14 @@ export const Navbar: React.FC<NavbarProps> = ({
           </div>
 
           {/* Navigation Links (Desktop) */}
-          <nav className="hidden lg:flex space-x-1">
+          <nav aria-label="Main Navigation" className="hidden lg:flex space-x-1">
             {tabs.map((tab) => {
               const active = currentTab === tab.id;
               return (
                 <button
                   key={tab.id}
                   onClick={() => onSelectTab(tab.id)}
+                  aria-current={active ? 'page' : undefined}
                   className={`flex items-center px-3 py-1.5 rounded-md text-xs font-mono font-medium transition-all duration-150 ${active
                     ? 'bg-[#21262d] text-[#58a6ff] border border-[#388bfd]/50 shadow-xs'
                     : 'text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#21262d]/60 border border-transparent'
@@ -138,6 +140,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   key={tab.id}
                   onClick={() => handleMobileTabClick(tab.id)}
+                  aria-current={active ? 'page' : undefined}
                   className={`flex items-center w-full px-3 py-2 rounded-md text-xs font-mono font-medium transition-colors ${active
                     ? 'bg-[#21262d] text-[#58a6ff] border border-[#388bfd]/50'
                     : 'text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#21262d]/60 border border-transparent'

@@ -152,13 +152,13 @@ func TestIntegritySchemaFutureVersionAndFreshEnable(t *testing.T) {
 	if err := initSchema(store.DB()); err != nil {
 		t.Fatalf("reopen migrated schema: %v", err)
 	}
-	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA user_version=13`); err != nil {
+	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA user_version=14`); err != nil {
 		t.Fatal(err)
 	}
 	if err := initSchema(store.DB()); err == nil {
 		t.Fatal("future database schema was accepted")
 	}
-	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
+	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 {
 		t.Fatalf("future schema version changed: version=%d err=%v", version, err)
 	}
 }

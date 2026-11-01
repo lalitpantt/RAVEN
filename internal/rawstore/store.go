@@ -93,7 +93,7 @@ func New(dbPath string) (*RawStore, error) {
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 12
+const CurrentSchemaVersion = 13
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -603,6 +603,13 @@ func migrateSchema(db sqlExecutor) error {
 			return fmt.Errorf("create analysis window schema v12: %w", err)
 		}
 		version = 12
+	}
+
+	if version < 13 {
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_analysis_findings_device_status ON analysis_findings(device_id,status);`); err != nil {
+			return fmt.Errorf("create analysis finding device index: %w", err)
+		}
+		version = 13
 	}
 
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {

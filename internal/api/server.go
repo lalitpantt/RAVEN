@@ -762,29 +762,97 @@ func (s *Server) handleAnalysisDevices(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	query := r.URL.Query()
+	state, category := query.Get("state"), query.Get("category")
+	site, deviceQuery := strings.TrimSpace(query.Get("site")), strings.TrimSpace(query.Get("device"))
+	window, hasWindow, validWindow := analysisWindow(query.Get("window"))
+	if !validWindow {
+		s.jsonError(w, http.StatusBadRequest, "window must be one of 1h, 24h, or 7d")
+		return
+	}
+	if state != "" && state != "green" && state != "yellow" && state != "red" && state != "unknown" && state != "disabled" {
+		s.jsonError(w, http.StatusBadRequest, "state must be green, yellow, red, unknown, or disabled")
+		return
+	}
+	if category != "" && !packs.KnownSourceCategories[category] {
+		s.jsonError(w, http.StatusBadRequest, "unsupported source category")
+		return
+	}
 	var devices []analysis.DeviceResource
 	if s.analysisSnapshot != nil && s.analysisSnapshot.Enabled() {
 		devices = s.analysisSnapshot.Devices()
 	}
-	sort.Slice(devices, func(i, j int) bool { return devices[i].Metadata.Name < devices[j].Metadata.Name })
-	total := len(devices)
-	start, end := min(offset, total), min(offset+limit, total)
-	page := devices[start:end]
-	ids := make([]string, len(page))
-	for i, device := range page {
+	filtered := make([]analysis.DeviceResource, 0, len(devices))
+	for _, device := range devices {
+		if category != "" && device.Spec.SourceCategory != category {
+			continue
+		}
+		if site != "" && !strings.Contains(strings.ToLower(device.Spec.Labels["site"]), strings.ToLower(site)) {
+			continue
+		}
+		if deviceQuery != "" && !strings.Contains(strings.ToLower(device.Metadata.Name+" "+device.Spec.DisplayName), strings.ToLower(deviceQuery)) {
+			continue
+		}
+		filtered = append(filtered, device)
+	}
+	sort.Slice(filtered, func(i, j int) bool { return filtered[i].Metadata.Name < filtered[j].Metadata.Name })
+	now := time.Now().UTC()
+	result := make([]analysis.DeviceTelemetry, 0, min(limit, len(filtered)))
+	if state == "" && !hasWindow {
+		total := len(filtered)
+		page := filtered[min(offset, total):min(offset+limit, total)]
+		telemetry, err := s.analysisDeviceTelemetry(r, page, now)
+		if err != nil {
+			s.jsonError(w, http.StatusInternalServerError, "failed to query device telemetry: "+err.Error())
+			return
+		}
+		result = telemetry
+		s.jsonResponse(w, http.StatusOK, map[string]any{"devices": result, "total": total, "limit": limit, "offset": offset, "filters": map[string]string{"state": state, "category": category, "site": site, "device": deviceQuery, "window": query.Get("window")}})
+		return
+	}
+	all := make([]analysis.DeviceTelemetry, 0, len(filtered))
+	for start := 0; start < len(filtered); start += 500 {
+		end := min(start+500, len(filtered))
+		page, err := s.analysisDeviceTelemetry(r, filtered[start:end], now)
+		if err != nil {
+			s.jsonError(w, http.StatusInternalServerError, "failed to query device telemetry: "+err.Error())
+			return
+		}
+		for _, item := range page {
+			if state != "" && string(item.State) != state {
+				continue
+			}
+			if hasWindow && (item.LastObservationAt == nil || item.LastObservationAt.Before(now.Add(-window))) {
+				continue
+			}
+			all = append(all, item)
+		}
+	}
+	total := len(all)
+	result = append(result, all[min(offset, total):min(offset+limit, total)]...)
+	s.jsonResponse(w, http.StatusOK, map[string]any{"devices": result, "total": total, "limit": limit, "offset": offset, "filters": map[string]string{"state": state, "category": category, "site": site, "device": deviceQuery, "window": query.Get("window")}})
+}
+
+func (s *Server) analysisDeviceTelemetry(r *http.Request, devices []analysis.DeviceResource, now time.Time) ([]analysis.DeviceTelemetry, error) {
+	ids := make([]string, len(devices))
+	for i, device := range devices {
 		ids[i] = device.Metadata.Name
 	}
 	stored, err := s.store.ListAnalysisDeviceTelemetry(r.Context(), ids)
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, "failed to query device telemetry: "+err.Error())
-		return
+		return nil, err
 	}
-	now := time.Now().UTC()
-	result := make([]analysis.DeviceTelemetry, 0, len(page))
-	for _, device := range page {
-		result = append(result, analysis.BuildDeviceTelemetry(device, stored[device.Metadata.Name], now))
+	findingCounts, err := s.store.CountActiveAnalysisFindingsByDevice(r.Context(), ids)
+	if err != nil {
+		return nil, err
 	}
-	s.jsonResponse(w, http.StatusOK, map[string]any{"devices": result, "total": total, "limit": limit, "offset": offset})
+	result := make([]analysis.DeviceTelemetry, 0, len(devices))
+	for _, device := range devices {
+		item := analysis.BuildDeviceTelemetry(device, stored[device.Metadata.Name], now)
+		item.ActiveFindingCount = findingCounts[device.Metadata.Name]
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 func (s *Server) handleAnalysisSources(w http.ResponseWriter, r *http.Request) {
@@ -818,12 +886,38 @@ func (s *Server) handleAnalysisFindings(w http.ResponseWriter, r *http.Request) 
 	if status == "" {
 		status = "open"
 	}
-	findings, total, err := s.store.ListAnalysisFindings(r.Context(), status, limit, offset)
+	query := r.URL.Query()
+	window, hasWindow, validWindow := analysisWindow(query.Get("window"))
+	if !validWindow {
+		s.jsonError(w, http.StatusBadRequest, "window must be one of 1h, 24h, or 7d")
+		return
+	}
+	filter := rawstore.AnalysisFindingFilter{Status: status, RuleID: strings.TrimSpace(query.Get("rule_id")), DeviceID: strings.TrimSpace(query.Get("device"))}
+	if hasWindow {
+		since := time.Now().UTC().Add(-window)
+		filter.Since = &since
+	}
+	findings, total, err := s.store.ListAnalysisFindingsFiltered(r.Context(), filter, limit, offset)
 	if err != nil {
 		s.jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.jsonResponse(w, http.StatusOK, map[string]any{"findings": findings, "status": status, "total": total, "limit": limit, "offset": offset})
+	s.jsonResponse(w, http.StatusOK, map[string]any{"findings": findings, "status": status, "rule_id": filter.RuleID, "device": filter.DeviceID, "window": query.Get("window"), "total": total, "limit": limit, "offset": offset})
+}
+
+func analysisWindow(value string) (time.Duration, bool, bool) {
+	switch value {
+	case "":
+		return 0, false, true
+	case "1h":
+		return time.Hour, true, true
+	case "24h":
+		return 24 * time.Hour, true, true
+	case "7d":
+		return 7 * 24 * time.Hour, true, true
+	default:
+		return 0, false, false
+	}
 }
 
 func (s *Server) handleAnalysisFinding(w http.ResponseWriter, r *http.Request) {

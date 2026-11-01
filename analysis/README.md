@@ -63,13 +63,13 @@ When Analysis has a valid non-empty inventory, the UI management API exposes the
 
 ```text
 GET /api/v1/analysis/status
-GET /api/v1/analysis/devices?limit=100&offset=0
+GET /api/v1/analysis/devices?state=yellow&category=network_device&site=hq&device=edge&window=24h&limit=100&offset=0
 GET /api/v1/analysis/sources?resolution=unassigned&limit=100&offset=0
-GET /api/v1/analysis/findings?status=open&limit=100&offset=0
+GET /api/v1/analysis/findings?status=open&rule_id=interface-down&device=edge-router-01&window=24h&limit=100&offset=0
 GET /api/v1/analysis/findings/{finding_id}?limit=100&offset=0
 ```
 
-The status response reports configuration/worker state (`disabled`, `running`, `delayed`, `degraded`, or `invalid_configuration`), checkpoint, backlog count and oldest age. Device pages include configured devices even when they have never been observed, state and explanation, last received/normalized/quarantined/matching-heartbeat timestamps and ages, active maintenance deadline, lifetime counters, five-minute rates, normalization ratio (`normalized / (normalized + quarantined)`), and identity confidence. `limit` is 1–500; `offset` is 0–1,000,000,000. The sources endpoint defaults to both `unknown` and `ambiguous`; `resolution=unknown` and `resolution=ambiguous` filter them separately. All routes are GET-only and do not mutate analysis or ingestion state.
+The status response reports configuration/worker state (`disabled`, `running`, `delayed`, `degraded`, or `invalid_configuration`), checkpoint, backlog count and oldest age. Device pages include configured devices even when they have never been observed, state and explanation, inventory labels, last received/normalized/quarantined/matching-heartbeat timestamps, active finding count, lifetime counters, five-minute rates, normalization ratio (`normalized / (normalized + quarantined)`), and identity confidence. Device filters support exact `state` and `category`, case-insensitive partial `site` matching against `labels.site`, case-insensitive partial `device` matching against ID/display name, and a last-activity `window` of `1h`, `24h`, or `7d`. Finding filters support `status` (`open`, `clearing`, `resolved`, or `all`), exact `rule_id`, exact device ID, and `window` based on last update. `limit` is 1–500; `offset` is 0–1,000,000,000. The sources endpoint defaults to both `unknown` and `ambiguous`; `resolution=unknown` and `resolution=ambiguous` filter them separately. All routes are GET-only and do not mutate analysis or ingestion state.
 
 The device status rules are conservative:
 
@@ -79,6 +79,6 @@ The device status rules are conservative:
 - `red` means a configured, matching heartbeat passed its critical deadline.
 - `unknown` means the device has no valid health signal yet, has no freshness boundary, or its event-only signal is stale. Silence from an event-only device never means it is down.
 
-The v9 migration backfills lifetime counters from existing A-02 observations; heartbeat times and five-minute rates start accumulating after the upgrade because earlier records did not store matched-heartbeat signals or rate buckets. During active processing, one-minute rate buckets are retained for about one hour. Schema v11 adds current findings plus append-only transition history; the worker commits them with identity projection/checkpoint progress. The finding endpoints are read-only and return event, trace, verify, and raw evidence links. The dedicated Analysis dashboard remains a later phase. Existing `/api/v1/sources`, stats, health, normalized event JSON/hash, and event verification contracts are unchanged.
+The v9 migration backfills lifetime counters from existing A-02 observations; heartbeat times and five-minute rates start accumulating after the upgrade because earlier records did not store matched-heartbeat signals or rate buckets. During active processing, one-minute rate buckets are retained for about one hour. Schema v11 adds current findings plus append-only transition history; schema v13 adds a finding/device index for dashboard counts. The worker commits findings with identity projection/checkpoint progress. The read-only dashboard links to event trace/verification and raw evidence; quarantined evidence opens the existing quarantine queue. Existing `/api/v1/sources`, stats, health, normalized event JSON/hash, and event verification contracts are unchanged.
 
 A sender-IP-only alias has weak identity confidence; hostname aliases are strong. Exact alias conflicts are rejected while loading inventory.

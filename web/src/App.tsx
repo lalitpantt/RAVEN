@@ -7,6 +7,7 @@ import { Onboard } from './pages/Onboard';
 import { Packs } from './pages/Packs';
 import { Config } from './pages/Config';
 import { Integrity } from './pages/Integrity';
+import { Analysis } from './pages/Analysis';
 import { apiService } from './services/api';
 import { SystemStats } from './types/telemetry';
 
@@ -57,6 +58,7 @@ export const App: React.FC = () => {
         {currentTab === 'packs' && <Packs />}
         {currentTab === 'config' && <Config />}
         {currentTab === 'integrity' && <Integrity />}
+        {currentTab === 'analysis' && <Analysis onNavigate={handleNavigate} />}
       </main>
 
       <footer className="bg-[#161b22] border-t border-[#30363d] py-3 text-center text-xs font-mono text-[#8b949e]">

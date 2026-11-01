@@ -18,38 +18,40 @@ const (
 )
 
 type DeviceTelemetry struct {
-	DeviceID             string      `json:"device_id"`
-	Name                 string      `json:"name"`
-	Version              string      `json:"version"`
-	DisplayName          string      `json:"display_name"`
-	SourceCategory       string      `json:"source_category"`
-	Enabled              bool        `json:"enabled"`
-	ReportingMode        string      `json:"reporting_mode"`
-	State                DeviceState `json:"state"`
-	Reason               string      `json:"reason"`
-	LastReceivedAt       *time.Time  `json:"last_received_at,omitempty"`
-	LastReceivedAge      *float64    `json:"last_received_age_seconds,omitempty"`
-	LastNormalizedAt     *time.Time  `json:"last_normalized_at,omitempty"`
-	LastNormalizedAge    *float64    `json:"last_normalized_age_seconds,omitempty"`
-	LastQuarantinedAt    *time.Time  `json:"last_quarantined_at,omitempty"`
-	LastQuarantinedAge   *float64    `json:"last_quarantined_age_seconds,omitempty"`
-	LastHeartbeatAt      *time.Time  `json:"last_heartbeat_at,omitempty"`
-	LastHeartbeatAge     *float64    `json:"last_heartbeat_age_seconds,omitempty"`
-	ReceivedCount        int64       `json:"received_count"`
-	NormalizedCount      int64       `json:"normalized_count"`
-	QuarantinedCount     int64       `json:"quarantined_count"`
-	NormalizationRatio   float64     `json:"normalization_ratio"`
-	HeartbeatCount       int64       `json:"heartbeat_count"`
-	ReceivedPerMinute    float64     `json:"received_per_minute"`
-	NormalizedPerMinute  float64     `json:"normalized_per_minute"`
-	QuarantinedPerMinute float64     `json:"quarantined_per_minute"`
-	IdentityConfidence   string      `json:"identity_confidence"`
-	MatchMethod          string      `json:"match_method"`
-	LastObservationAt    *time.Time  `json:"last_observation_at,omitempty"`
-	UpdatedAt            *time.Time  `json:"updated_at,omitempty"`
-	EvaluatedAt          time.Time   `json:"evaluated_at"`
-	Maintenance          bool        `json:"maintenance"`
-	MaintenanceUntil     *time.Time  `json:"maintenance_until,omitempty"`
+	DeviceID             string            `json:"device_id"`
+	Name                 string            `json:"name"`
+	Version              string            `json:"version"`
+	DisplayName          string            `json:"display_name"`
+	SourceCategory       string            `json:"source_category"`
+	Labels               map[string]string `json:"labels,omitempty"`
+	Enabled              bool              `json:"enabled"`
+	ReportingMode        string            `json:"reporting_mode"`
+	State                DeviceState       `json:"state"`
+	Reason               string            `json:"reason"`
+	LastReceivedAt       *time.Time        `json:"last_received_at,omitempty"`
+	LastReceivedAge      *float64          `json:"last_received_age_seconds,omitempty"`
+	LastNormalizedAt     *time.Time        `json:"last_normalized_at,omitempty"`
+	LastNormalizedAge    *float64          `json:"last_normalized_age_seconds,omitempty"`
+	LastQuarantinedAt    *time.Time        `json:"last_quarantined_at,omitempty"`
+	LastQuarantinedAge   *float64          `json:"last_quarantined_age_seconds,omitempty"`
+	LastHeartbeatAt      *time.Time        `json:"last_heartbeat_at,omitempty"`
+	LastHeartbeatAge     *float64          `json:"last_heartbeat_age_seconds,omitempty"`
+	ReceivedCount        int64             `json:"received_count"`
+	NormalizedCount      int64             `json:"normalized_count"`
+	QuarantinedCount     int64             `json:"quarantined_count"`
+	ActiveFindingCount   int64             `json:"active_finding_count"`
+	NormalizationRatio   float64           `json:"normalization_ratio"`
+	HeartbeatCount       int64             `json:"heartbeat_count"`
+	ReceivedPerMinute    float64           `json:"received_per_minute"`
+	NormalizedPerMinute  float64           `json:"normalized_per_minute"`
+	QuarantinedPerMinute float64           `json:"quarantined_per_minute"`
+	IdentityConfidence   string            `json:"identity_confidence"`
+	MatchMethod          string            `json:"match_method"`
+	LastObservationAt    *time.Time        `json:"last_observation_at,omitempty"`
+	UpdatedAt            *time.Time        `json:"updated_at,omitempty"`
+	EvaluatedAt          time.Time         `json:"evaluated_at"`
+	Maintenance          bool              `json:"maintenance"`
+	MaintenanceUntil     *time.Time        `json:"maintenance_until,omitempty"`
 }
 
 func BuildDeviceTelemetry(device DeviceResource, stored rawstore.AnalysisDeviceTelemetry, now time.Time) DeviceTelemetry {
@@ -58,6 +60,7 @@ func BuildDeviceTelemetry(device DeviceResource, stored rawstore.AnalysisDeviceT
 	result := DeviceTelemetry{
 		DeviceID: device.Metadata.Name, Name: device.Metadata.Name, Version: device.Metadata.Version,
 		DisplayName: device.Spec.DisplayName, SourceCategory: device.Spec.SourceCategory,
+		Labels:  device.Spec.Labels,
 		Enabled: enabled, ReportingMode: device.Spec.Reporting.Mode,
 		ReceivedCount: stored.ReceivedCount, NormalizedCount: stored.NormalizedCount,
 		QuarantinedCount: stored.QuarantinedCount, HeartbeatCount: stored.HeartbeatCount,
