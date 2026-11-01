@@ -19,18 +19,24 @@ const (
 type WorkerStatus struct {
 	QueueStatus rawstore.AnalysisQueueStatus
 	LastError   string
+	Running     bool
 }
 
 // Worker consumes durable observations after the ingestion transactions commit.
 type Worker struct {
-	store    *rawstore.RawStore
-	resolver atomic.Pointer[Resolver]
+	store  *rawstore.RawStore
+	config atomic.Pointer[workerConfig]
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	done    chan struct{}
 	started bool
 	lastErr string
+}
+
+type workerConfig struct {
+	resolver *Resolver
+	snapshot *Snapshot
 }
 
 func NewWorker(store *rawstore.RawStore, resolver *Resolver) (*Worker, error) {
@@ -41,16 +47,25 @@ func NewWorker(store *rawstore.RawStore, resolver *Resolver) (*Worker, error) {
 		resolver = &Resolver{}
 	}
 	worker := &Worker{store: store}
-	worker.resolver.Store(resolver)
+	worker.config.Store(&workerConfig{resolver: resolver})
 	return worker, nil
 }
 
-// SetResolver atomically activates a validated inventory snapshot for future batches.
+// SetResolver atomically replaces the identity resolver for future batches.
 func (w *Worker) SetResolver(resolver *Resolver) {
 	if resolver == nil {
 		resolver = &Resolver{}
 	}
-	w.resolver.Store(resolver)
+	w.config.Store(&workerConfig{resolver: resolver})
+}
+
+// SetSnapshot atomically activates validated inventory and heartbeat rules.
+func (w *Worker) SetSnapshot(snapshot *Snapshot) {
+	if snapshot == nil {
+		w.config.Store(&workerConfig{resolver: &Resolver{}})
+		return
+	}
+	w.config.Store(&workerConfig{resolver: snapshot.Resolver(), snapshot: snapshot})
 }
 
 // Start enables durable handoff before beginning the worker. Stopping the worker
@@ -111,9 +126,24 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	resolutions := make([]rawstore.AnalysisResolution, len(observations))
-	resolver := w.resolver.Load()
+	config := w.config.Load()
 	for i, observation := range observations {
-		resolutions[i] = resolver.Resolve(observation.IdentityHints)
+		resolutions[i] = config.resolver.Resolve(observation.IdentityHints)
+		snapshot := config.snapshot
+		if snapshot == nil || observation.Kind != "normalized" || resolutions[i].Resolution != "matched" {
+			continue
+		}
+		rule, ok := heartbeatRuleFor(snapshot, resolutions[i].DeviceID)
+		if !ok {
+			continue
+		}
+		event, err := w.store.GetNormalizedByID(ctx, observation.EventID)
+		if err != nil {
+			return 0, err
+		}
+		if matchesRuleFields(rule, event.OCSF) {
+			resolutions[i].HeartbeatRule = rule.Metadata.Name
+		}
 	}
 	if err := w.store.CommitAnalysisBatch(ctx, checkpoint, observations, resolutions); err != nil {
 		return 0, err
@@ -127,9 +157,9 @@ func (w *Worker) Status(ctx context.Context) (WorkerStatus, error) {
 		return WorkerStatus{}, err
 	}
 	w.mu.Lock()
-	lastErr := w.lastErr
+	lastErr, running := w.lastErr, w.started
 	w.mu.Unlock()
-	return WorkerStatus{QueueStatus: queueStatus, LastError: lastErr}, nil
+	return WorkerStatus{QueueStatus: queueStatus, LastError: lastErr, Running: running}, nil
 }
 
 func (w *Worker) Stop() {

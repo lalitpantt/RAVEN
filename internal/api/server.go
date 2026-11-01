@@ -27,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/mod/semver"
+	"raven/internal/analysis"
 	"raven/internal/connections"
 	"raven/internal/decode"
 	"raven/internal/marketplace"
@@ -73,6 +74,9 @@ type Server struct {
 	distFS            fs.FS
 	startTime         time.Time
 	ingestTracker     IngestTracker
+	analysisSnapshot  *analysis.Snapshot
+	analysisWorker    *analysis.Worker
+	analysisConfigErr string
 	witnessURL        string
 	witnessAdminToken string
 	auditCtx          context.Context
@@ -139,6 +143,12 @@ func (s *Server) SetIngestTracker(t IngestTracker) {
 	s.ingestTracker = t
 }
 
+func (s *Server) SetAnalysis(snapshot *analysis.Snapshot, worker *analysis.Worker, configErr string) {
+	s.analysisSnapshot = snapshot
+	s.analysisWorker = worker
+	s.analysisConfigErr = configErr
+}
+
 // SetIntegrityWitness configures separate witness-admin forwarding credentials.
 func (s *Server) SetIntegrityWitness(baseURL, adminToken string) {
 	s.witnessURL = strings.TrimRight(baseURL, "/")
@@ -168,6 +178,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/quarantine/replay-all", s.handleReplayAllQuarantine)
 	mux.HandleFunc("POST /api/v1/quarantine/{id}/replay", s.handleReplayQuarantine)
 	mux.HandleFunc("GET /api/v1/sources", s.handleListSources)
+	mux.HandleFunc("GET /api/v1/analysis/status", s.handleAnalysisStatus)
+	mux.HandleFunc("GET /api/v1/analysis/devices", s.handleAnalysisDevices)
+	mux.HandleFunc("GET /api/v1/analysis/sources", s.handleAnalysisSources)
 	mux.HandleFunc("GET /api/v1/packs", s.handleListPacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs", s.handleMarketplacePacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs/{name}", s.handleMarketplacePack)
@@ -679,6 +692,146 @@ func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusOK, map[string]any{
 		"sources": sources,
 	})
+}
+
+func (s *Server) handleAnalysisStatus(w http.ResponseWriter, r *http.Request) {
+	queue, err := s.store.AnalysisStatus(r.Context())
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, "failed to query analysis backlog: "+err.Error())
+		return
+	}
+	workerRunning, workerError := false, ""
+	if s.analysisWorker != nil {
+		status, err := s.analysisWorker.Status(r.Context())
+		if err != nil {
+			s.jsonError(w, http.StatusInternalServerError, "failed to query analysis worker: "+err.Error())
+			return
+		}
+		workerRunning, workerError = status.Running, status.LastError
+	}
+	enabled := s.analysisSnapshot != nil && s.analysisSnapshot.Enabled() && s.analysisConfigErr == ""
+	state := "disabled"
+	reason := "Analysis is disabled because no valid non-empty configuration is loaded."
+	if enabled {
+		state = "running"
+		reason = "The Analysis worker is processing durable observations."
+		if !workerRunning {
+			state = "degraded"
+			reason = "Analysis is configured, but its observation worker is not running."
+		} else if queue.Pending > 0 {
+			state = "delayed"
+			reason = "Durable Analysis observations are waiting for projection."
+		}
+	}
+	if workerError != "" {
+		state = "degraded"
+		reason = "The Analysis worker reported an error."
+	}
+	var oldestAge float64
+	if !queue.OldestPending.IsZero() {
+		oldestAge = time.Since(queue.OldestPending).Seconds()
+		if oldestAge < 0 {
+			oldestAge = 0
+		}
+	}
+	response := map[string]any{
+		"state": state, "reason": reason, "enabled": enabled, "worker_running": workerRunning,
+		"device_count": 0, "rule_count": 0, "pending_count": queue.Pending,
+		"oldest_pending_at": timeOrNil(queue.OldestPending), "oldest_pending_age_seconds": oldestAge,
+		"checkpoint_id": queue.CheckpointID, "last_error": workerError,
+		"evaluated_at": time.Now().UTC(),
+	}
+	if s.analysisSnapshot != nil {
+		response["device_count"] = s.analysisSnapshot.DeviceCount()
+		response["rule_count"] = s.analysisSnapshot.RuleCount()
+	}
+	if s.analysisConfigErr != "" {
+		response["configuration_error"] = s.analysisConfigErr
+		state = "invalid_configuration"
+		response["state"] = state
+		response["reason"] = "Invalid Analysis configuration disabled the worker."
+	}
+	s.jsonResponse(w, http.StatusOK, response)
+}
+
+func (s *Server) handleAnalysisDevices(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := s.analysisPagination(w, r)
+	if !ok {
+		return
+	}
+	var devices []analysis.DeviceResource
+	if s.analysisSnapshot != nil && s.analysisSnapshot.Enabled() {
+		devices = s.analysisSnapshot.Devices()
+	}
+	sort.Slice(devices, func(i, j int) bool { return devices[i].Metadata.Name < devices[j].Metadata.Name })
+	total := len(devices)
+	start, end := min(offset, total), min(offset+limit, total)
+	page := devices[start:end]
+	ids := make([]string, len(page))
+	for i, device := range page {
+		ids[i] = device.Metadata.Name
+	}
+	stored, err := s.store.ListAnalysisDeviceTelemetry(r.Context(), ids)
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, "failed to query device telemetry: "+err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	result := make([]analysis.DeviceTelemetry, 0, len(page))
+	for _, device := range page {
+		result = append(result, analysis.BuildDeviceTelemetry(device, stored[device.Metadata.Name], now))
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{"devices": result, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) handleAnalysisSources(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := s.analysisPagination(w, r)
+	if !ok {
+		return
+	}
+	resolution := r.URL.Query().Get("resolution")
+	if resolution == "" {
+		resolution = "unassigned"
+	}
+	count, err := s.store.CountAnalysisSources(r.Context(), resolution)
+	if err != nil {
+		s.jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sources, err := s.store.ListAnalysisSources(r.Context(), resolution, limit, offset)
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, "failed to query analysis sources: "+err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{"sources": sources, "resolution": resolution, "total": count, "limit": limit, "offset": offset})
+}
+
+func (s *Server) analysisPagination(w http.ResponseWriter, r *http.Request) (int, int, bool) {
+	limit, offset := 100, 0
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 500 {
+			s.jsonError(w, http.StatusBadRequest, "limit must be between 1 and 500")
+			return 0, 0, false
+		}
+		limit = parsed
+	}
+	if value := r.URL.Query().Get("offset"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > 1_000_000_000 {
+			s.jsonError(w, http.StatusBadRequest, "offset must be between 0 and 1000000000")
+			return 0, 0, false
+		}
+		offset = parsed
+	}
+	return limit, offset, true
+}
+
+func timeOrNil(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC()
 }
 
 func (s *Server) handleListPacks(w http.ResponseWriter, r *http.Request) {

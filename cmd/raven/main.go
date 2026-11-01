@@ -456,9 +456,11 @@ func main() {
 	}
 	defer store.Close()
 	var analysisSnapshot *analysis.Snapshot
+	var analysisConfigError string
 	if *analysisDir != "none" {
 		analysisSnapshot, err = analysis.LoadDirectory(*analysisDir)
 		if err != nil {
+			analysisConfigError = err.Error()
 			fmt.Fprintf(os.Stderr, "WARNING: Analysis configuration disabled: %v\n", err)
 			analysisSnapshot = nil
 		} else if analysisSnapshot.Enabled() {
@@ -601,6 +603,7 @@ func main() {
 	if analysisSnapshot != nil && analysisSnapshot.Enabled() {
 		analysisWorker, err = analysis.NewWorker(store, analysisSnapshot.Resolver())
 		if err == nil {
+			analysisWorker.SetSnapshot(analysisSnapshot)
 			err = analysisWorker.Start(context.Background())
 		}
 		if err != nil {
@@ -706,6 +709,7 @@ func main() {
 			Workers:    *workers,
 		}
 		uiServer = api.NewServer(*uiAddr, store, p, packManager, *packsDir, cfgInfo, web.Dist(), Version)
+		uiServer.SetAnalysis(analysisSnapshot, analysisWorker, analysisConfigError)
 		uiServer.SetIntegrityWitness(os.Getenv("RAVEN_WITNESS_URL"), os.Getenv("RAVEN_WITNESS_ADMIN_TOKEN"))
 		uiServer.SetMarketplaceOptions(*marketplaceOnline, *marketplaceURL)
 		uiServer.SetIngestTracker(mgr)

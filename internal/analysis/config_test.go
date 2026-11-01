@@ -76,6 +76,7 @@ func TestLoadDirectoryRejectsInvalidConfiguration(t *testing.T) {
 		{name: "unknown field", device: strings.Replace(validDevice("edge-1"), "  displayName:", "  unexpected: true\n  displayName:", 1), want: "field unexpected not found"},
 		{name: "bad duration", device: strings.Replace(validDevice("edge-1"), "mode: event", "mode: event\n    freshnessAfter: 1ms", 1), want: "freshnessAfter"},
 		{name: "unknown heartbeat rule", device: heartbeatDevice("not-installed"), rule: heartbeatRule("valid-heartbeat"), want: "unknown heartbeatRule"},
+		{name: "disabled heartbeat rule", device: heartbeatDevice("valid-heartbeat"), rule: strings.Replace(heartbeatRule("valid-heartbeat"), "  kind: heartbeat", "  enabled: false\n  kind: heartbeat", 1), want: "disabled heartbeatRule"},
 		{name: "wrong heartbeat rule kind", device: heartbeatDevice("router-down"), rule: eventRule("router-down", "^down$"), want: "expected heartbeat"},
 		{name: "malformed regex", device: validDevice("edge-1"), rule: eventRule("regex-rule", "["), want: "invalid Go RE2 regex"},
 		{name: "unsupported operator", device: validDevice("edge-1"), rule: strings.Replace(eventRule("bad-op", "^down$"), "op: regex", "op: matches", 1), want: "unsupported operator"},

@@ -2,7 +2,9 @@ package analysis
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +70,20 @@ func TestWorkerProjectsIdentitiesAndResumesFromDurableCheckpoint(t *testing.T) {
 	if err != nil || status.QueueStatus.Pending != 0 || status.QueueStatus.CheckpointID == 0 {
 		t.Fatalf("worker status after processing: %+v err=%v", status, err)
 	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE analysis_worker_state SET checkpoint_id=0 WHERE singleton=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatalf("replay linked observation batch: %v", err)
+	}
+	status, err = worker.Status(ctx)
+	if err != nil || status.QueueStatus.Pending != 0 {
+		t.Fatalf("idempotent projection replay did not advance checkpoint: %+v err=%v", status, err)
+	}
+	telemetry, err := store.ListAnalysisDeviceTelemetry(ctx, []string{"edge-1"})
+	if err != nil || telemetry["edge-1"].ReceivedCount != 1 || telemetry["edge-1"].NormalizedCount != 1 {
+		t.Fatalf("replayed batch duplicated device counters: %+v err=%v", telemetry, err)
+	}
 
 	matched, err := store.ListAnalysisSources(ctx, "matched", 20, 0)
 	if err != nil || len(matched) != 2 {
@@ -126,6 +142,51 @@ func TestWorkerProjectsIdentitiesAndResumesFromDurableCheckpoint(t *testing.T) {
 	restarted, err = store.AnalysisStatus(ctx)
 	if err != nil || restarted.Pending != 0 || restarted.CheckpointID != status.QueueStatus.CheckpointID+1 {
 		t.Fatalf("restart did not checkpoint recovered observation: %+v err=%v", restarted, err)
+	}
+}
+
+func TestWorkerProjectsOnlyConfiguredHeartbeatMatches(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	device := strings.Replace(heartbeatDevice("router-heartbeat"), "      - edge-1.example.internal", "      - edge-1.example.internal\n    source_ip:\n      - 10.0.0.8", 1)
+	writeConfig(t, directory, "devices", "router.yaml", device)
+	writeConfig(t, directory, "rules", "heartbeat.yaml", heartbeatRule("router-heartbeat"))
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "heartbeat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, err := NewWorker(store, snapshot.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.SetSnapshot(snapshot)
+
+	for i, activity := range []string{"heartbeat", "configuration_change"} {
+		raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.0.0.8", RawBytes: []byte(activity), ReceivedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: fmt.Sprintf("heartbeat-event-%d", i), RawID: raw.RawID, ReceivedTime: raw.ReceivedAt}, OCSF: map[string]any{"activity_name": activity}}
+		if err := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"syslog_host": "edge-1.example.internal"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	telemetry, err := store.ListAnalysisDeviceTelemetry(ctx, []string{"edge-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := telemetry["edge-1"]
+	if got.ReceivedCount != 2 || got.NormalizedCount != 2 || got.HeartbeatCount != 1 || got.LastHeartbeatAt.IsZero() || got.ReceivedPerMinute != 0.4 || got.NormalizedPerMinute != 0.4 {
+		t.Fatalf("device rollup=%+v; only the configured heartbeat event should count", got)
 	}
 }
 

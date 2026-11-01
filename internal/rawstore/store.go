@@ -93,7 +93,7 @@ func New(dbPath string) (*RawStore, error) {
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 8
+const CurrentSchemaVersion = 10
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -424,6 +424,60 @@ func migrateSchema(db sqlExecutor) error {
 			return fmt.Errorf("failed to create analysis observation schema v8: %w", err)
 		}
 		version = 8
+	}
+
+	if version < 9 {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS analysis_device_telemetry (
+			device_id TEXT PRIMARY KEY,
+			last_received_at TEXT,
+			last_normalized_at TEXT,
+			last_quarantined_at TEXT,
+			last_heartbeat_at TEXT,
+			received_count INTEGER NOT NULL DEFAULT 0 CHECK(received_count>=0),
+			normalized_count INTEGER NOT NULL DEFAULT 0 CHECK(normalized_count>=0),
+			quarantined_count INTEGER NOT NULL DEFAULT 0 CHECK(quarantined_count>=0),
+			heartbeat_count INTEGER NOT NULL DEFAULT 0 CHECK(heartbeat_count>=0),
+			identity_confidence TEXT NOT NULL DEFAULT 'none' CHECK(identity_confidence IN ('strong','weak','none')),
+			match_method TEXT NOT NULL DEFAULT '',
+			last_observation_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		INSERT OR IGNORE INTO analysis_device_telemetry(
+			device_id,last_received_at,last_normalized_at,last_quarantined_at,
+			received_count,normalized_count,quarantined_count,identity_confidence,
+			match_method,last_observation_at,updated_at
+		)
+		SELECT aos.device_id,
+			MAX(CASE WHEN o.kind='raw_received' THEN o.occurred_at END),
+			MAX(CASE WHEN o.kind='normalized' THEN o.occurred_at END),
+			MAX(CASE WHEN o.kind='quarantined' THEN o.occurred_at END),
+			SUM(CASE WHEN o.kind='raw_received' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN o.kind='normalized' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN o.kind='quarantined' THEN 1 ELSE 0 END),
+			CASE WHEN MAX(CASE WHEN aos.confidence='strong' THEN 1 ELSE 0 END)=1 THEN 'strong' ELSE 'weak' END,
+			'historical',MAX(o.occurred_at),MAX(o.occurred_at)
+		FROM analysis_observation_sources aos
+		JOIN analysis_observations o ON o.observation_id=aos.observation_id
+		WHERE aos.resolution='matched' AND aos.device_id IS NOT NULL
+		GROUP BY aos.device_id;`); err != nil {
+			return fmt.Errorf("failed to create analysis telemetry schema v9: %w", err)
+		}
+		version = 9
+	}
+
+	if version < 10 {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS analysis_device_minute_buckets (
+			device_id TEXT NOT NULL,
+			bucket_start TEXT NOT NULL,
+			received_count INTEGER NOT NULL DEFAULT 0 CHECK(received_count>=0),
+			normalized_count INTEGER NOT NULL DEFAULT 0 CHECK(normalized_count>=0),
+			quarantined_count INTEGER NOT NULL DEFAULT 0 CHECK(quarantined_count>=0),
+			PRIMARY KEY(device_id,bucket_start)
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_device_buckets_start ON analysis_device_minute_buckets(bucket_start);`); err != nil {
+			return fmt.Errorf("failed to create analysis rate schema v10: %w", err)
+		}
+		version = 10
 	}
 
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {

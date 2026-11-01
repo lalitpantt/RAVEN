@@ -32,24 +32,44 @@ type AnalysisObservation struct {
 }
 
 type AnalysisResolution struct {
-	SourceKey   string
-	Resolution  string
-	DeviceID    string
-	MatchMethod string
-	Confidence  string
+	SourceKey     string
+	Resolution    string
+	DeviceID      string
+	MatchMethod   string
+	Confidence    string
+	HeartbeatRule string
 }
 
 type AnalysisSource struct {
-	SourceKey        string
-	IdentityHints    model.AnalysisIdentityHints
-	Resolution       string
-	DeviceID         string
-	MatchMethod      string
-	Confidence       string
-	FirstSeenAt      time.Time
-	LastSeenAt       time.Time
-	ObservationCount int64
-	LastObservation  int64
+	SourceKey        string                      `json:"source_key"`
+	IdentityHints    model.AnalysisIdentityHints `json:"identity_hints"`
+	Resolution       string                      `json:"resolution"`
+	DeviceID         string                      `json:"device_id,omitempty"`
+	MatchMethod      string                      `json:"match_method"`
+	Confidence       string                      `json:"confidence"`
+	FirstSeenAt      time.Time                   `json:"first_seen_at"`
+	LastSeenAt       time.Time                   `json:"last_seen_at"`
+	ObservationCount int64                       `json:"observation_count"`
+	LastObservation  int64                       `json:"last_observation_id"`
+}
+
+type AnalysisDeviceTelemetry struct {
+	DeviceID             string
+	LastReceivedAt       time.Time
+	LastNormalizedAt     time.Time
+	LastQuarantinedAt    time.Time
+	LastHeartbeatAt      time.Time
+	ReceivedCount        int64
+	NormalizedCount      int64
+	QuarantinedCount     int64
+	HeartbeatCount       int64
+	ReceivedPerMinute    float64
+	NormalizedPerMinute  float64
+	QuarantinedPerMinute float64
+	IdentityConfidence   string
+	MatchMethod          string
+	LastObservationAt    time.Time
+	UpdatedAt            time.Time
 }
 
 type AnalysisQueueStatus struct {
@@ -188,7 +208,7 @@ func (s *RawStore) CommitAnalysisBatch(ctx context.Context, expectedCheckpoint i
 		if observation.ID <= previousID || resolution.SourceKey != AnalysisSourceKey(observation.IdentityHints) || (resolution.Resolution != "matched" && resolution.Resolution != "unknown" && resolution.Resolution != "ambiguous") {
 			return fmt.Errorf("invalid analysis batch item %d", i)
 		}
-		if len(resolution.MatchMethod) == 0 || len(resolution.MatchMethod) > 64 || len(resolution.DeviceID) > 128 {
+		if len(resolution.MatchMethod) == 0 || len(resolution.MatchMethod) > 64 || len(resolution.DeviceID) > 128 || len(resolution.HeartbeatRule) > 128 {
 			return fmt.Errorf("invalid analysis match metadata at batch item %d", i)
 		}
 		if resolution.Confidence != "strong" && resolution.Confidence != "weak" && resolution.Confidence != "none" {
@@ -217,7 +237,13 @@ func (s *RawStore) CommitAnalysisBatch(ctx context.Context, expectedCheckpoint i
 		} else if linkErr != nil {
 			return linkErr
 		} else {
+			previousID = observation.ID
 			continue
+		}
+		if resolution.Resolution == "matched" {
+			if err := upsertAnalysisDeviceTelemetry(ctx, tx, observation, resolution); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO analysis_observation_sources(observation_id,source_key,resolution,device_id,match_method,confidence)
 			VALUES(?,?,?,?,?,?)`, observation.ID, resolution.SourceKey, resolution.Resolution, nullableString(resolution.DeviceID), resolution.MatchMethod, resolution.Confidence); err != nil {
@@ -232,7 +258,67 @@ func (s *RawStore) CommitAnalysisBatch(ctx context.Context, expectedCheckpoint i
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return ErrAnalysisCheckpointConflict
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM analysis_device_minute_buckets WHERE bucket_start<?`, time.Now().UTC().Add(-time.Hour).Truncate(time.Minute).Format(time.RFC3339)); err != nil {
+		return fmt.Errorf("prune expired device rate buckets: %w", err)
+	}
 	return tx.Commit()
+}
+
+func upsertAnalysisDeviceTelemetry(ctx context.Context, tx *sql.Tx, observation AnalysisObservation, resolution AnalysisResolution) error {
+	if resolution.HeartbeatRule != "" && (observation.Kind != "normalized" || resolution.Resolution != "matched") {
+		return errors.New("heartbeat signal must refer to a matched normalized observation")
+	}
+	at := observation.OccurredAt.UTC().Format(time.RFC3339Nano)
+	bucket := observation.OccurredAt.UTC().Truncate(time.Minute).Format(time.RFC3339)
+	var receivedAt, normalizedAt, quarantinedAt, heartbeatAt any
+	switch observation.Kind {
+	case "raw_received":
+		receivedAt = at
+	case "normalized":
+		normalizedAt = at
+		if resolution.HeartbeatRule != "" {
+			heartbeatAt = at
+		}
+	case "quarantined":
+		quarantinedAt = at
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO analysis_device_telemetry(
+		device_id,last_received_at,last_normalized_at,last_quarantined_at,last_heartbeat_at,
+		received_count,normalized_count,quarantined_count,heartbeat_count,identity_confidence,
+		match_method,last_observation_at,updated_at
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(device_id) DO UPDATE SET
+		last_received_at=CASE WHEN excluded.last_received_at IS NULL THEN analysis_device_telemetry.last_received_at WHEN analysis_device_telemetry.last_received_at IS NULL OR excluded.last_received_at>analysis_device_telemetry.last_received_at THEN excluded.last_received_at ELSE analysis_device_telemetry.last_received_at END,
+		last_normalized_at=CASE WHEN excluded.last_normalized_at IS NULL THEN analysis_device_telemetry.last_normalized_at WHEN analysis_device_telemetry.last_normalized_at IS NULL OR excluded.last_normalized_at>analysis_device_telemetry.last_normalized_at THEN excluded.last_normalized_at ELSE analysis_device_telemetry.last_normalized_at END,
+		last_quarantined_at=CASE WHEN excluded.last_quarantined_at IS NULL THEN analysis_device_telemetry.last_quarantined_at WHEN analysis_device_telemetry.last_quarantined_at IS NULL OR excluded.last_quarantined_at>analysis_device_telemetry.last_quarantined_at THEN excluded.last_quarantined_at ELSE analysis_device_telemetry.last_quarantined_at END,
+		last_heartbeat_at=CASE WHEN excluded.last_heartbeat_at IS NULL THEN analysis_device_telemetry.last_heartbeat_at WHEN analysis_device_telemetry.last_heartbeat_at IS NULL OR excluded.last_heartbeat_at>analysis_device_telemetry.last_heartbeat_at THEN excluded.last_heartbeat_at ELSE analysis_device_telemetry.last_heartbeat_at END,
+		received_count=analysis_device_telemetry.received_count+excluded.received_count,
+		normalized_count=analysis_device_telemetry.normalized_count+excluded.normalized_count,
+		quarantined_count=analysis_device_telemetry.quarantined_count+excluded.quarantined_count,
+		heartbeat_count=analysis_device_telemetry.heartbeat_count+excluded.heartbeat_count,
+		identity_confidence=CASE WHEN excluded.last_observation_at>=analysis_device_telemetry.last_observation_at THEN excluded.identity_confidence ELSE analysis_device_telemetry.identity_confidence END,
+		match_method=CASE WHEN excluded.last_observation_at>=analysis_device_telemetry.last_observation_at THEN excluded.match_method ELSE analysis_device_telemetry.match_method END,
+		last_observation_at=MAX(analysis_device_telemetry.last_observation_at,excluded.last_observation_at),
+		updated_at=MAX(analysis_device_telemetry.updated_at,excluded.updated_at)`, resolution.DeviceID, receivedAt, normalizedAt, quarantinedAt, heartbeatAt, boolCount(observation.Kind == "raw_received"), boolCount(observation.Kind == "normalized"), boolCount(observation.Kind == "quarantined"), boolCount(resolution.HeartbeatRule != ""), resolution.Confidence, resolution.MatchMethod, at, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("update device telemetry %s: %w", resolution.DeviceID, err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO analysis_device_minute_buckets(device_id,bucket_start,received_count,normalized_count,quarantined_count)
+		VALUES(?,?,?,?,?) ON CONFLICT(device_id,bucket_start) DO UPDATE SET
+		received_count=analysis_device_minute_buckets.received_count+excluded.received_count,
+		normalized_count=analysis_device_minute_buckets.normalized_count+excluded.normalized_count,
+		quarantined_count=analysis_device_minute_buckets.quarantined_count+excluded.quarantined_count`, resolution.DeviceID, bucket, boolCount(observation.Kind == "raw_received"), boolCount(observation.Kind == "normalized"), boolCount(observation.Kind == "quarantined"))
+	if err != nil {
+		return fmt.Errorf("update device event-rate bucket %s: %w", resolution.DeviceID, err)
+	}
+	return nil
+}
+
+func boolCount(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // AnalysisStatus reports the persisted worker cursor and the oldest pending age.
@@ -263,11 +349,15 @@ func (s *RawStore) ListAnalysisSources(ctx context.Context, resolution string, l
 	query := `SELECT source_key,identity_hints_json,resolution,COALESCE(device_id,''),match_method,confidence,first_seen_at,last_seen_at,observation_count,last_observation_id FROM analysis_sources`
 	args := []any{}
 	if resolution != "" {
-		if resolution != "matched" && resolution != "unknown" && resolution != "ambiguous" {
+		if resolution != "matched" && resolution != "unknown" && resolution != "ambiguous" && resolution != "unassigned" {
 			return nil, fmt.Errorf("invalid analysis source resolution %q", resolution)
 		}
-		query += ` WHERE resolution=?`
-		args = append(args, resolution)
+		if resolution == "unassigned" {
+			query += ` WHERE resolution IN ('unknown','ambiguous')`
+		} else {
+			query += ` WHERE resolution=?`
+			args = append(args, resolution)
+		}
 	}
 	query += ` ORDER BY last_seen_at DESC,source_key LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
@@ -291,6 +381,71 @@ func (s *RawStore) ListAnalysisSources(ctx context.Context, resolution string, l
 		sources = append(sources, source)
 	}
 	return sources, rows.Err()
+}
+
+func (s *RawStore) CountAnalysisSources(ctx context.Context, resolution string) (int64, error) {
+	query := `SELECT COUNT(*) FROM analysis_sources`
+	var args []any
+	switch resolution {
+	case "":
+	case "unassigned":
+		query += ` WHERE resolution IN ('unknown','ambiguous')`
+	case "matched", "unknown", "ambiguous":
+		query += ` WHERE resolution=?`
+		args = append(args, resolution)
+	default:
+		return 0, fmt.Errorf("invalid analysis source resolution %q", resolution)
+	}
+	var count int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (s *RawStore) ListAnalysisDeviceTelemetry(ctx context.Context, deviceIDs []string) (map[string]AnalysisDeviceTelemetry, error) {
+	result := make(map[string]AnalysisDeviceTelemetry, len(deviceIDs))
+	if len(deviceIDs) == 0 {
+		return result, nil
+	}
+	if len(deviceIDs) > 500 {
+		return nil, errors.New("analysis device telemetry query is limited to 500 IDs")
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(deviceIDs)), ",")
+	args := make([]any, len(deviceIDs))
+	for i, id := range deviceIDs {
+		args[i] = id
+	}
+	since := time.Now().UTC().Truncate(time.Minute).Add(-4 * time.Minute).Format(time.RFC3339)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.device_id,COALESCE(t.last_received_at,''),COALESCE(t.last_normalized_at,''),COALESCE(t.last_quarantined_at,''),COALESCE(t.last_heartbeat_at,''),t.received_count,t.normalized_count,t.quarantined_count,t.heartbeat_count,t.identity_confidence,t.match_method,t.last_observation_at,t.updated_at,
+		COALESCE(SUM(b.received_count),0)/5.0,COALESCE(SUM(b.normalized_count),0)/5.0,COALESCE(SUM(b.quarantined_count),0)/5.0
+		FROM analysis_device_telemetry t LEFT JOIN analysis_device_minute_buckets b ON b.device_id=t.device_id AND b.bucket_start>=?
+		WHERE t.device_id IN (`+placeholders+") GROUP BY t.device_id", append([]any{since}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item AnalysisDeviceTelemetry
+		var received, normalized, quarantined, heartbeat string
+		var last, updated string
+		if err := rows.Scan(&item.DeviceID, &received, &normalized, &quarantined, &heartbeat, &item.ReceivedCount, &item.NormalizedCount, &item.QuarantinedCount, &item.HeartbeatCount, &item.IdentityConfidence, &item.MatchMethod, &last, &updated, &item.ReceivedPerMinute, &item.NormalizedPerMinute, &item.QuarantinedPerMinute); err != nil {
+			return nil, err
+		}
+		for _, timestamp := range []struct {
+			value  string
+			target *time.Time
+		}{{received, &item.LastReceivedAt}, {normalized, &item.LastNormalizedAt}, {quarantined, &item.LastQuarantinedAt}, {heartbeat, &item.LastHeartbeatAt}, {last, &item.LastObservationAt}, {updated, &item.UpdatedAt}} {
+			if timestamp.value == "" {
+				continue
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, timestamp.value)
+			if err != nil {
+				return nil, fmt.Errorf("parse analysis device telemetry timestamp: %w", err)
+			}
+			*timestamp.target = parsed
+		}
+		result[item.DeviceID] = item
+	}
+	return result, rows.Err()
 }
 
 func AnalysisSourceKey(hints model.AnalysisIdentityHints) string {

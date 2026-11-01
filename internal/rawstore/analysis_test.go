@@ -131,6 +131,58 @@ func TestAnalysisIsDisabledByDefaultAndFileSpoolRetryIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestAnalysisTelemetryMigrationBackfillsExistingProjections(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	store.SetAnalysisEnabled(true)
+	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "203.0.113.9", RawBytes: []byte("preserve"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	observations, checkpoint, err := store.AnalysisBatch(ctx, 10)
+	if err != nil || len(observations) != 1 {
+		t.Fatalf("load raw observation: rows=%d err=%v", len(observations), err)
+	}
+	hints := observations[0].IdentityHints
+	resolution := AnalysisResolution{SourceKey: AnalysisSourceKey(hints), Resolution: "matched", DeviceID: "edge-1", MatchMethod: "source_ip", Confidence: "weak"}
+	if err := store.CommitAnalysisBatch(ctx, checkpoint, observations, []AnalysisResolution{resolution}); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := store.dbPath
+	if _, err := store.DB().ExecContext(ctx, `DROP TABLE analysis_device_telemetry; PRAGMA user_version=8`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	projection, err := migrated.ListAnalysisDeviceTelemetry(ctx, []string{"edge-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := projection["edge-1"]
+	if got.ReceivedCount != 1 || got.LastReceivedAt.IsZero() || got.IdentityConfidence != "weak" {
+		t.Fatalf("v9 migration failed to backfill telemetry: %+v", got)
+	}
+	var fkViolations int
+	rows, err := migrated.DB().QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		fkViolations++
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fkViolations != 0 {
+		t.Fatalf("migration left %d foreign-key violations", fkViolations)
+	}
+}
+
 func TestAnalysisObservationsRemainOutsideIntegrityEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := setupTestStore(t)

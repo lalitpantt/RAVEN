@@ -170,6 +170,18 @@ func (s *Snapshot) Resolver() *Resolver {
 	return s.resolver
 }
 
+func (s *Snapshot) Device(id string) (DeviceResource, bool) {
+	if s == nil {
+		return DeviceResource{}, false
+	}
+	for _, device := range s.devices {
+		if device.Metadata.Name == id {
+			return cloneDevice(device), true
+		}
+	}
+	return DeviceResource{}, false
+}
+
 func (s *Snapshot) Devices() []DeviceResource {
 	if s == nil {
 		return nil
@@ -735,6 +747,9 @@ func validateHeartbeatReferences(snapshot *Snapshot) error {
 		rule := snapshot.rules[index]
 		if rule.Spec.Kind != "heartbeat" {
 			return fmt.Errorf("device %q heartbeatRule %q is a %s rule, expected heartbeat", device.Metadata.Name, reporting.HeartbeatRule, rule.Spec.Kind)
+		}
+		if rule.Spec.Enabled != nil && !*rule.Spec.Enabled {
+			return fmt.Errorf("device %q references disabled heartbeatRule %q", device.Metadata.Name, reporting.HeartbeatRule)
 		}
 		if rule.Spec.SourceCategory != "" && rule.Spec.SourceCategory != device.Spec.SourceCategory {
 			return fmt.Errorf("device %q sourceCategory %q does not match heartbeat rule %q category %q", device.Metadata.Name, device.Spec.SourceCategory, reporting.HeartbeatRule, rule.Spec.SourceCategory)

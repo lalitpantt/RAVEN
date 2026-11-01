@@ -13,6 +13,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"raven/internal/analysis"
 	"raven/internal/api"
 	"raven/internal/connections"
 	"raven/internal/integrity"
@@ -91,6 +92,112 @@ spec:
 
 	srv := api.NewServer("127.0.0.1:0", store, pipe, packMgr, packsDir, cfg, mockFS, "test-version")
 	return srv, store, pipe, tempDir
+}
+
+func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+	snapshot, err := analysis.LoadDirectory(filepath.Join("..", "..", "analysis", "examples"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := analysis.NewWorker(store, snapshot.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.SetSnapshot(snapshot)
+	if err := worker.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Stop()
+	srv.SetAnalysis(snapshot, worker, "")
+
+	ctx := context.Background()
+	raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.20.0.1", RawBytes: []byte("heartbeat"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: "api-analysis-heartbeat", RawID: raw.RawID, SourceCategory: "network_device", SourceID: "edge-router-01", ReceivedTime: raw.ReceivedAt}, OCSF: map[string]any{"activity_name": "heartbeat"}}
+	if err := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"source_ip": "10.20.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "http_post", SourceIP: "192.0.2.44", RawBytes: []byte("unassigned"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	ambiguousRaw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.20.0.1", RawBytes: []byte("ambiguous identity"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.QuarantineChild(ctx, model.QuarantineEntry{
+		QuarantineID: "analysis-ambiguous-quarantine", RawID: ambiguousRaw.RawID,
+		RawSHA256: ambiguousRaw.RawSHA256, Stage: "analysis-test", Reason: "ambiguous identity",
+		QuarantinedAt: time.Now().UTC(), AnalysisHints: model.AnalysisIdentityHints{"source_ip": "10.20.0.1", "host": "app-server-01"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, err := worker.Status(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.QueueStatus.Pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("analysis worker did not drain observations: %+v", status.QueueStatus)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	handler := srv.Handler()
+	var observationsBefore, telemetryBefore int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_observations`).Scan(&observationsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_device_telemetry`).Scan(&telemetryBefore); err != nil {
+		t.Fatal(err)
+	}
+	request := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	status := request("/api/v1/analysis/status")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"state":"running"`) || !strings.Contains(status.Body.String(), `"pending_count":0`) || !strings.Contains(status.Body.String(), `"reason":`) || !strings.Contains(status.Body.String(), `"evaluated_at":`) {
+		t.Fatalf("analysis service health response: %d %s", status.Code, status.Body.String())
+	}
+	devices := request("/api/v1/analysis/devices?limit=1&offset=1")
+	if devices.Code != http.StatusOK || !strings.Contains(devices.Body.String(), `"total":2`) || !strings.Contains(devices.Body.String(), `"limit":1`) {
+		t.Fatalf("paginated device response: %d %s", devices.Code, devices.Body.String())
+	}
+	first := request("/api/v1/analysis/devices?limit=1&offset=1")
+	if !strings.Contains(first.Body.String(), `"device_id":"edge-router-01"`) || !strings.Contains(first.Body.String(), `"state":"green"`) || !strings.Contains(first.Body.String(), `"heartbeat_count":1`) || !strings.Contains(first.Body.String(), `"normalized_per_minute":0.2`) {
+		t.Fatalf("heartbeat device projection: %s", first.Body.String())
+	}
+	unassigned := request("/api/v1/analysis/sources?resolution=unassigned&limit=10")
+	if unassigned.Code != http.StatusOK || !strings.Contains(unassigned.Body.String(), `"total":2`) || !strings.Contains(unassigned.Body.String(), `"resolution":"unknown"`) || !strings.Contains(unassigned.Body.String(), `"resolution":"ambiguous"`) {
+		t.Fatalf("unassigned sources response: %d %s", unassigned.Code, unassigned.Body.String())
+	}
+	if invalid := request("/api/v1/analysis/devices?limit=501"); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid page limit status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	if legacy := request("/api/v1/sources"); legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), `"sources"`) {
+		t.Fatalf("existing source API changed: %d %s", legacy.Code, legacy.Body.String())
+	}
+	var observationsAfter, telemetryAfter int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_observations`).Scan(&observationsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_device_telemetry`).Scan(&telemetryAfter); err != nil {
+		t.Fatal(err)
+	}
+	if observationsAfter != observationsBefore || telemetryAfter != telemetryBefore {
+		t.Fatalf("read-only API mutated analysis state: observations %d->%d telemetry %d->%d", observationsBefore, observationsAfter, telemetryBefore, telemetryAfter)
+	}
 }
 
 func TestAPI_IntegrityJobsAndPendingProofUnauthenticated(t *testing.T) {
