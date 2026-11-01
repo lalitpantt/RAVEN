@@ -9,6 +9,54 @@ import (
 	"raven/internal/outbox"
 )
 
+func TestAnalysisBaselineSchemaMigrationIsAdditiveRepeatableAndAtomic(t *testing.T) {
+	store := setupTestStore(t)
+	ctx := context.Background()
+	var freshVersion int
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&freshVersion); err != nil || freshVersion != CurrentSchemaVersion {
+		t.Fatalf("blank database did not migrate to head: version=%d err=%v", freshVersion, err)
+	}
+	originalPayload := []byte("existing raw event survives additive migration")
+	original, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "192.0.2.10", RawBytes: originalPayload, ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("store pre-migration raw event: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DROP INDEX idx_analysis_baseline_state; DROP INDEX idx_analysis_baseline_owner; DROP TABLE analysis_baseline_states; PRAGMA user_version=13; CREATE TABLE analysis_baseline_states(unrelated INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initSchema(store.DB()); err == nil {
+		t.Fatal("baseline migration succeeded against a conflicting table")
+	}
+	var version, indexCount int
+	if err := store.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
+		t.Fatalf("failed migration changed schema version=%d err=%v", version, err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_analysis_baseline_state','idx_analysis_baseline_owner')`).Scan(&indexCount); err != nil || indexCount != 0 {
+		t.Fatalf("failed migration left baseline indexes: count=%d err=%v", indexCount, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DROP TABLE analysis_baseline_states`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initSchema(store.DB()); err != nil {
+		t.Fatalf("upgrade schema v13 to v14: %v", err)
+	}
+	if err := initSchema(store.DB()); err != nil {
+		t.Fatalf("repeat schema v14 migration: %v", err)
+	}
+	upgraded, err := store.Retrieve(ctx, original.RawID)
+	if err != nil || string(upgraded.Payload) != string(originalPayload) {
+		t.Fatalf("existing raw event changed during v13-to-v14 migration: event=%+v err=%v", upgraded, err)
+	}
+	rows, err := store.DB().QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("foreign_key_check returned a violation")
+	}
+}
+
 func TestAnalysisOutboxWritesAreAtomicWithLifecycleRows(t *testing.T) {
 	ctx := context.Background()
 	store := setupTestStore(t)

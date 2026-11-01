@@ -1,0 +1,21 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: payment-heartbeat
+  version: 1.0.0
+  description: One-shot simulator heartbeat used to demonstrate green, yellow, then red
+spec:
+  displayName: Payment Heartbeat Probe
+  sourceCategory: application
+  aliases:
+    server:
+      - pay-srv-heartbeat-01
+  labels:
+    site: demo
+    service: payments
+  reporting:
+    mode: heartbeat
+    heartbeatRule: simulator-heartbeat
+    expectedInterval: 5s
+    warningAfter: 10s
+    criticalAfter: 25s

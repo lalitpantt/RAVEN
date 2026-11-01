@@ -1,0 +1,18 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: asa-gateway
+  version: 1.0.0
+  description: Cisco ASA simulator source
+spec:
+  displayName: ASA Gateway
+  sourceCategory: network_device
+  aliases:
+    syslog_host:
+      - asa-gw-01
+  labels:
+    site: demo
+    criticality: high
+  reporting:
+    mode: event
+    freshnessAfter: 2m

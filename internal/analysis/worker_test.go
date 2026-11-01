@@ -445,6 +445,97 @@ spec:
 	}
 }
 
+func TestWorkerOptInBaselineDetectsBurstAndClearsWhenRateRecovers(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	writeConfig(t, directory, "devices", "edge.yaml", validDevice("edge-1"))
+	writeConfig(t, directory, "rules", "baseline.yaml", baselineRule(4, 3))
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "baseline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, err := NewWorker(store, snapshot.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.SetSnapshot(snapshot)
+	base := time.Now().UTC().Truncate(time.Minute).Add(-8 * time.Minute)
+	index := 0
+	appendEvent := func(at time.Time) {
+		t.Helper()
+		index++
+		id := fmt.Sprintf("baseline-%03d", index)
+		raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.0.0.1", RawBytes: []byte(id), ReceivedAt: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: id, RawID: raw.RawID, SourceCategory: "network_device", ReceivedTime: at}, OCSF: map[string]any{"activity_name": "authentication_failure"}}
+		if err := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"syslog_host": "edge-1.example.internal"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().ExecContext(ctx, `UPDATE analysis_observations SET occurred_at=? WHERE event_id=? AND kind='normalized'`, at.UTC().Format(time.RFC3339Nano), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendEvent(base)
+	for minute := 1; minute <= 4; minute++ {
+		for n := 0; n < 4; n++ {
+			appendEvent(base.Add(time.Duration(minute)*time.Minute + time.Duration(n)*time.Second))
+		}
+	}
+	for n := 0; n < 14; n++ {
+		appendEvent(base.Add(5*time.Minute + time.Duration(n)*time.Second))
+	}
+	for {
+		count, err := worker.RunOnce(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			break
+		}
+	}
+	evaluateAt := base.Add(6*time.Minute + 30*time.Second)
+	worker.windowCursor = 0
+	if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), evaluateAt); err != nil {
+		t.Fatal(err)
+	}
+	states, total, err := store.ListAnalysisBaselineStates(ctx, 10, 0)
+	if err != nil || total != 1 || len(states) != 1 || states[0].Status != "anomaly" || states[0].Direction != "high" || states[0].Algorithm != baselineAlgorithm || states[0].AlgorithmVersion != "1" || states[0].HistoryCount != 4 || states[0].ObservedCount != 14 || states[0].FindingID == "" {
+		t.Fatalf("burst baseline state=%+v total=%d err=%v", states, total, err)
+	}
+	findings, total, err := store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || total != 1 || len(findings) != 1 || findings[0].RuleID != "auth-rate-baseline" || findings[0].LastEventID == "" {
+		t.Fatalf("baseline finding=%+v total=%d err=%v", findings, total, err)
+	}
+	for n := 0; n < 4; n++ {
+		appendEvent(base.Add(6*time.Minute + time.Duration(n)*time.Second))
+	}
+	for {
+		count, err := worker.RunOnce(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if count == 0 {
+			break
+		}
+	}
+	worker.windowCursor = 0
+	if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), base.Add(7*time.Minute+30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "clearing", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("recovered baseline did not enter clear hold: %+v err=%v", findings, err)
+	}
+}
+
 func TestWorkerHeartbeatDeadlineEscalatesRecoversAndHonorsMaintenance(t *testing.T) {
 	ctx := context.Background()
 	directory := t.TempDir()

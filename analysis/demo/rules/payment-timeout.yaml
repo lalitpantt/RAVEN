@@ -1,0 +1,23 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: payment-timeout
+  version: 1.0.0
+  description: Flags payment gateway timeout events from the simulator
+spec:
+  kind: event
+  sourceCategory: application
+  match:
+    fields:
+      - path: message
+        op: contains
+        value: Payment gateway timeout
+  clear:
+    - path: message
+      op: contains
+      value: Payment processed successfully
+  finding:
+    severity: high
+    state: red
+    title: Payment gateway timeout
+    clearAfter: 30s

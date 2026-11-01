@@ -1,0 +1,18 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: edge-firewall
+  version: 1.0.0
+  description: Palo Alto simulator source
+spec:
+  displayName: Edge Firewall
+  sourceCategory: network_device
+  aliases:
+    syslog_host:
+      - pa-fw-01
+  labels:
+    site: demo
+    criticality: high
+  reporting:
+    mode: event
+    freshnessAfter: 2m

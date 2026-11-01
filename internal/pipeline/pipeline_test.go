@@ -409,6 +409,29 @@ func TestQuarantineWriteFailureRemainsPending(t *testing.T) {
 	}
 }
 
+func TestStatsKeepsInMemoryCountsWhenStoreQueriesFail(t *testing.T) {
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "stats.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(Config{}, store, NewMemorySink())
+	p.accepted.Store(10)
+	p.normalized.Store(8)
+	p.quarantined.Store(1)
+	p.pending.Store(1)
+	if err := store.DB().Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := p.Stats()
+	if valid, reason := stats.VerifyInvariant(); !valid {
+		t.Fatalf("storage read failure must not replace live counters with zero: %s", reason)
+	}
+	if stats.Normalized != 8 || stats.Quarantined != 1 || stats.Pending != 1 {
+		t.Fatalf("unexpected fallback counters: %+v", stats)
+	}
+}
+
 func TestStartupRecoveryResumesOnlyUncommittedBatchChildren(t *testing.T) {
 	store, err := rawstore.New(filepath.Join(t.TempDir(), "recovery.db"))
 	if err != nil {

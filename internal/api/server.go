@@ -180,6 +180,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/quarantine/{id}/replay", s.handleReplayQuarantine)
 	mux.HandleFunc("GET /api/v1/sources", s.handleListSources)
 	mux.HandleFunc("GET /api/v1/analysis/status", s.handleAnalysisStatus)
+	mux.HandleFunc("GET /api/v1/analysis/baselines", s.handleAnalysisBaselines)
 	mux.HandleFunc("GET /api/v1/analysis/devices", s.handleAnalysisDevices)
 	mux.HandleFunc("GET /api/v1/analysis/sources", s.handleAnalysisSources)
 	mux.HandleFunc("GET /api/v1/analysis/findings", s.handleAnalysisFindings)
@@ -755,6 +756,19 @@ func (s *Server) handleAnalysisStatus(w http.ResponseWriter, r *http.Request) {
 		response["reason"] = "Invalid Analysis configuration disabled the worker."
 	}
 	s.jsonResponse(w, http.StatusOK, response)
+}
+
+func (s *Server) handleAnalysisBaselines(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := s.analysisPagination(w, r)
+	if !ok {
+		return
+	}
+	states, total, err := s.store.ListAnalysisBaselineStates(r.Context(), limit, offset)
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, "failed to query analysis baselines: "+err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{"baselines": states, "total": total, "limit": limit, "offset": offset})
 }
 
 func (s *Server) handleAnalysisDevices(w http.ResponseWriter, r *http.Request) {

@@ -118,7 +118,7 @@ func TestIntegritySchemaFutureVersionAndFreshEnable(t *testing.T) {
 	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != CurrentSchemaVersion {
 		t.Fatalf("schema version=%d err=%v", version, err)
 	}
-	for _, table := range []string{"integrity_streams", "integrity_entries", "integrity_batches", "integrity_batch_entries", "integrity_witness_sync", "integrity_operations", "integrity_audit_runs", "integrity_findings"} {
+	for _, table := range []string{"integrity_streams", "integrity_entries", "integrity_batches", "integrity_batch_entries", "integrity_witness_sync", "integrity_operations", "integrity_audit_runs", "integrity_findings", "analysis_baseline_states"} {
 		var count int
 		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("table %s missing: count=%d err=%v", table, count, err)
@@ -152,13 +152,13 @@ func TestIntegritySchemaFutureVersionAndFreshEnable(t *testing.T) {
 	if err := initSchema(store.DB()); err != nil {
 		t.Fatalf("reopen migrated schema: %v", err)
 	}
-	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA user_version=14`); err != nil {
+	if _, err := store.DB().ExecContext(context.Background(), `PRAGMA user_version=15`); err != nil {
 		t.Fatal(err)
 	}
 	if err := initSchema(store.DB()); err == nil {
 		t.Fatal("future database schema was accepted")
 	}
-	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 14 {
+	if err := store.DB().QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 15 {
 		t.Fatalf("future schema version changed: version=%d err=%v", version, err)
 	}
 }

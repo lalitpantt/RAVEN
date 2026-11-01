@@ -93,7 +93,7 @@ func New(dbPath string) (*RawStore, error) {
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 13
+const CurrentSchemaVersion = 14
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -610,6 +610,37 @@ func migrateSchema(db sqlExecutor) error {
 			return fmt.Errorf("create analysis finding device index: %w", err)
 		}
 		version = 13
+	}
+
+	if version < 14 {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS analysis_baseline_states (
+			rule_id TEXT NOT NULL,
+			owner_type TEXT NOT NULL CHECK(owner_type IN ('device','source')),
+			owner_id TEXT NOT NULL,
+			instance_key TEXT NOT NULL,
+			algorithm TEXT NOT NULL,
+			algorithm_version TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('warming_up','ready','anomaly','maintenance')),
+			direction TEXT NOT NULL DEFAULT '',
+			minimum_history INTEGER NOT NULL,
+			history_count INTEGER NOT NULL,
+			first_seen_at TEXT NOT NULL,
+			interval_start TEXT NOT NULL,
+			interval_end TEXT NOT NULL,
+			observed_count INTEGER NOT NULL,
+			baseline_median REAL NOT NULL,
+			baseline_mad REAL NOT NULL,
+			lower_threshold REAL NOT NULL,
+			upper_threshold REAL NOT NULL,
+			finding_id TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(rule_id,owner_type,owner_id,instance_key)
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_baseline_state ON analysis_baseline_states(status,updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_analysis_baseline_owner ON analysis_baseline_states(owner_type,owner_id,updated_at DESC);`); err != nil {
+			return fmt.Errorf("create analysis baseline state schema: %w", err)
+		}
+		version = 14
 	}
 
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {

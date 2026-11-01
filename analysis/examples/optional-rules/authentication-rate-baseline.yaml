@@ -1,0 +1,24 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: authentication-rate-baseline
+  version: 1.0.0
+  description: Experimental rolling rate baseline; tune only with labeled local traffic.
+spec:
+  kind: baseline
+  sourceCategory: network_device
+  match:
+    fields:
+      - {path: activity_name, op: eq, value: authentication_failure}
+  window:
+    signal: event_count
+    duration: 5m
+    groupBy: [activity_name]
+    baseline:
+      minimumHistory: 8
+      sensitivity: 3
+  finding:
+    severity: high
+    state: yellow
+    title: Unusual authentication event rate
+    clearAfter: 5m

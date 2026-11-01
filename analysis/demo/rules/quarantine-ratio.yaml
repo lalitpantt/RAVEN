@@ -1,0 +1,20 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: elevated-quarantine-ratio
+  version: 1.0.0
+  description: Shows a yellow finding for a source sending malformed simulator records
+spec:
+  kind: quality
+  match:
+    fields: []
+  window:
+    signal: quarantine_ratio
+    duration: 5m
+    ratioAtLeast: 0.25
+    clearRatio: 0.1
+  finding:
+    severity: high
+    state: yellow
+    title: Simulator source has a high quarantine rate
+    clearAfter: 1m

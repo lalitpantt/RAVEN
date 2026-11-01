@@ -1,0 +1,16 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: disabled-spare
+  version: 1.0.0
+  description: Deliberately disabled inventory entry shown in grey
+spec:
+  displayName: Standby Sensor (Disabled)
+  sourceCategory: other
+  aliases:
+    host:
+      - standby-sensor-01
+  enabled: false
+  labels:
+    site: demo
+    purpose: grey-status-example

@@ -46,6 +46,7 @@ type AnalysisWindowSample struct {
 	RuleID, OwnerType, OwnerID, InstanceKey, EventID, RawID, Outcome string
 	SourceKey, DeviceID, RuleVersion, Severity, State, Title         string
 	RecordOrdinal, CountAtLeast, ClearBelow, Consecutive             int
+	BaselineMinimumHistory                                           int
 	RatioAtLeast, ClearRatio                                         float64
 	Duration, For, ClearAfter                                        time.Duration
 	OccurredAt, EvaluatedAt                                          time.Time

@@ -873,8 +873,12 @@ func (p *Pipeline) Stats() model.LossAccountingStats {
 	stats := model.LossAccountingStats{Accepted: p.accepted.Load(), Normalized: p.normalized.Load(), Quarantined: p.quarantined.Load(), Pending: p.pending.Load(), Delivered: p.delivered.Load()}
 	if p.store != nil {
 		ctx := context.Background()
-		stats.Normalized, _ = p.store.CountNormalized(ctx)
-		stats.Quarantined, _ = p.store.CountQuarantine(ctx)
+		if normalized, err := p.store.CountNormalized(ctx); err == nil {
+			stats.Normalized = normalized
+		}
+		if quarantined, err := p.store.CountQuarantine(ctx); err == nil {
+			stats.Quarantined = quarantined
+		}
 		stats.Pending = p.pending.Load()
 	}
 	if p.outbox != nil && p.durableSink != nil {

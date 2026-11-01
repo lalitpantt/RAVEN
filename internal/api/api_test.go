@@ -197,6 +197,13 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"state":"running"`) || !strings.Contains(status.Body.String(), `"pending_count":0`) || !strings.Contains(status.Body.String(), `"reason":`) || !strings.Contains(status.Body.String(), `"evaluated_at":`) {
 		t.Fatalf("analysis service health response: %d %s", status.Code, status.Body.String())
 	}
+	baselines := request("/api/v1/analysis/baselines?limit=10&offset=0")
+	if baselines.Code != http.StatusOK || !strings.Contains(baselines.Body.String(), `"baselines":[]`) || !strings.Contains(baselines.Body.String(), `"total":0`) {
+		t.Fatalf("read-only baseline status response: %d %s", baselines.Code, baselines.Body.String())
+	}
+	if invalid := request("/api/v1/analysis/baselines?limit=501"); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid baseline page limit status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
 	devices := request("/api/v1/analysis/devices?limit=1&offset=1")
 	if devices.Code != http.StatusOK || !strings.Contains(devices.Body.String(), `"total":2`) || !strings.Contains(devices.Body.String(), `"limit":1`) {
 		t.Fatalf("paginated device response: %d %s", devices.Code, devices.Body.String())

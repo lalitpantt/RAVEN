@@ -1,0 +1,18 @@
+apiVersion: raven.io/v1
+kind: Device
+metadata:
+  name: linux-auth
+  version: 1.0.0
+  description: Linux SSH authentication simulator source
+spec:
+  displayName: Linux Auth Server
+  sourceCategory: os
+  aliases:
+    syslog_host:
+      - srv-prod-01
+  labels:
+    site: demo
+    role: authentication
+  reporting:
+    mode: event
+    freshnessAfter: 2m

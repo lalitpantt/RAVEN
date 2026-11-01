@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,10 @@ func TestLoadDirectoryRejectsInvalidConfiguration(t *testing.T) {
 		{name: "unsupported operator", device: validDevice("edge-1"), rule: strings.Replace(eventRule("bad-op", "^down$"), "op: regex", "op: matches", 1), want: "unsupported operator"},
 		{name: "raw payload path", device: validDevice("edge-1"), rule: strings.Replace(eventRule("raw-rule", "^x$"), "path: message", "path: raw.payload", 1), want: "cannot reference raw payload"},
 		{name: "duplicate rule ID", device: validDevice("edge-1"), rule: eventRule("same-rule", "^x$"), secondRule: eventRule("same-rule", "^y$"), want: "duplicate rule ID"},
+		{name: "baseline too little history", rule: baselineRule(3, 3), want: "minimumHistory"},
+		{name: "baseline duration too short", rule: strings.Replace(baselineRule(8, 3), "duration: 1m", "duration: 30s", 1), want: "baseline duration"},
+		{name: "baseline missing config", rule: strings.Replace(baselineRule(8, 3), "    baseline: {minimumHistory: 8, sensitivity: 3}\n", "", 1), want: "require spec.window.baseline"},
+		{name: "baseline fixed threshold conflict", rule: strings.Replace(baselineRule(8, 3), "    baseline: {minimumHistory: 8, sensitivity: 3}", "    baseline: {minimumHistory: 8, sensitivity: 3}\n    countAtLeast: 5", 1), want: "cannot configure fixed count"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -103,6 +108,32 @@ func TestLoadDirectoryRejectsInvalidConfiguration(t *testing.T) {
 				t.Fatalf("LoadDirectory error = %v, want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadDirectoryAcceptsOptInRateBaseline(t *testing.T) {
+	directory := t.TempDir()
+	writeConfig(t, directory, "devices", "device.yaml", validDevice("edge-1"))
+	writeConfig(t, directory, "rules", "baseline.yaml", baselineRule(8, 3))
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, ok := snapshot.Rule("auth-rate-baseline")
+	if !ok || rule.Spec.Kind != "baseline" || rule.Spec.Window.Baseline.MinimumHistory != 8 || rule.Spec.Window.Baseline.Sensitivity != 3 {
+		t.Fatalf("baseline rule not loaded with frozen settings: %+v", rule)
+	}
+}
+
+func TestOptionalBaselineExampleValidates(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "analysis", "examples", "optional-rules", "authentication-rate-baseline.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	writeConfig(t, directory, "rules", "baseline.yaml", string(data))
+	if _, err := LoadDirectory(directory); err != nil {
+		t.Fatalf("optional baseline example failed validation: %v", err)
 	}
 }
 
@@ -183,4 +214,8 @@ func heartbeatRule(name string) string {
 
 func eventRule(name, regex string) string {
 	return "apiVersion: raven.io/v1\nkind: AnalysisRule\nmetadata:\n  name: " + name + "\n  version: 1.0.0\nspec:\n  kind: event\n  sourceCategory: network_device\n  match:\n    fields:\n      - path: message\n        op: regex\n        value: '" + regex + "'\n  clear:\n    - path: message\n      op: eq\n      value: clear\n  finding:\n    severity: high\n    state: red\n    title: A test finding\n    clearAfter: 30s\n"
+}
+
+func baselineRule(minimum int, sensitivity float64) string {
+	return "apiVersion: raven.io/v1\nkind: AnalysisRule\nmetadata:\n  name: auth-rate-baseline\n  version: 1.0.0\nspec:\n  kind: baseline\n  sourceCategory: network_device\n  match:\n    fields:\n      - {path: activity_name, op: eq, value: authentication_failure}\n  window:\n    signal: event_count\n    duration: 1m\n    groupBy: [activity_name]\n    baseline: {minimumHistory: " + fmt.Sprint(minimum) + ", sensitivity: " + fmt.Sprint(sensitivity) + "}\n  finding:\n    severity: high\n    state: yellow\n    title: Unusual authentication rate\n    clearAfter: 1m\n"
 }

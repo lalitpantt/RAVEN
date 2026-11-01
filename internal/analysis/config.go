@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -128,14 +129,20 @@ type compiledCondition struct {
 }
 
 type RuleWindow struct {
-	Signal       string   `yaml:"signal" json:"signal"`
-	Duration     Duration `yaml:"duration" json:"duration"`
-	GroupBy      []string `yaml:"groupBy" json:"groupBy"`
-	CountAtLeast int      `yaml:"countAtLeast,omitempty" json:"countAtLeast,omitempty"`
-	ClearBelow   int      `yaml:"clearBelow,omitempty" json:"clearBelow,omitempty"`
-	RatioAtLeast float64  `yaml:"ratioAtLeast,omitempty" json:"ratioAtLeast,omitempty"`
-	ClearRatio   float64  `yaml:"clearRatio,omitempty" json:"clearRatio,omitempty"`
-	Consecutive  int      `yaml:"consecutive,omitempty" json:"consecutive,omitempty"`
+	Signal       string        `yaml:"signal" json:"signal"`
+	Duration     Duration      `yaml:"duration" json:"duration"`
+	GroupBy      []string      `yaml:"groupBy" json:"groupBy"`
+	Baseline     *BaselineSpec `yaml:"baseline,omitempty" json:"baseline,omitempty"`
+	CountAtLeast int           `yaml:"countAtLeast,omitempty" json:"countAtLeast,omitempty"`
+	ClearBelow   int           `yaml:"clearBelow,omitempty" json:"clearBelow,omitempty"`
+	RatioAtLeast float64       `yaml:"ratioAtLeast,omitempty" json:"ratioAtLeast,omitempty"`
+	ClearRatio   float64       `yaml:"clearRatio,omitempty" json:"clearRatio,omitempty"`
+	Consecutive  int           `yaml:"consecutive,omitempty" json:"consecutive,omitempty"`
+}
+
+type BaselineSpec struct {
+	MinimumHistory int     `yaml:"minimumHistory" json:"minimumHistory"`
+	Sensitivity    float64 `yaml:"sensitivity,omitempty" json:"sensitivity,omitempty"`
 }
 
 type FindingSpec struct {
@@ -252,6 +259,10 @@ func cloneRule(source AnalysisRuleResource) AnalysisRuleResource {
 	if source.Spec.Window != nil {
 		window := *source.Spec.Window
 		window.GroupBy = append([]string(nil), source.Spec.Window.GroupBy...)
+		if source.Spec.Window.Baseline != nil {
+			baseline := *source.Spec.Window.Baseline
+			window.Baseline = &baseline
+		}
 		copy.Spec.Window = &window
 	}
 	if source.Spec.Enabled != nil {
@@ -593,7 +604,7 @@ func validateRule(rule *AnalysisRuleResource) error {
 		if rule.Spec.Window != nil {
 			return errors.New("event and heartbeat rules cannot define spec.window")
 		}
-	case "window", "quality":
+	case "window", "quality", "baseline":
 		if rule.Spec.Window == nil {
 			return fmt.Errorf("%s rules require spec.window", rule.Spec.Kind)
 		}
@@ -616,8 +627,8 @@ func validateRule(rule *AnalysisRuleResource) error {
 	if rule.Spec.Kind == "event" && len(rule.Spec.Clear) == 0 {
 		return errors.New("event rules require an explicit spec.clear condition")
 	}
-	if (rule.Spec.Kind == "window" || rule.Spec.Kind == "quality") && len(rule.Spec.Clear) != 0 {
-		return errors.New("window and quality rules use spec.window clear thresholds instead of spec.clear")
+	if (rule.Spec.Kind == "window" || rule.Spec.Kind == "quality" || rule.Spec.Kind == "baseline") && len(rule.Spec.Clear) != 0 {
+		return errors.New("window, quality, and baseline rules use spec.window thresholds instead of spec.clear")
 	}
 	if rule.Spec.Kind != "heartbeat" && rule.Spec.Finding.ClearAfter == 0 {
 		return errors.New("non-heartbeat rules require spec.finding.clearAfter")
@@ -674,6 +685,31 @@ func validateRule(rule *AnalysisRuleResource) error {
 			if window.CountAtLeast != 0 || window.ClearBelow != 0 {
 				return errors.New("quality rules cannot configure count thresholds")
 			}
+		case "baseline":
+			if window.Signal != "event_count" || len(rule.Spec.Match.Fields) == 0 {
+				return errors.New("baseline rules require event_count and spec.match.fields")
+			}
+			if window.Baseline == nil {
+				return errors.New("baseline rules require spec.window.baseline")
+			}
+			if window.Baseline.MinimumHistory < 4 || window.Baseline.MinimumHistory > 28 {
+				return errors.New("spec.window.baseline.minimumHistory must be between 4 and 28 completed intervals")
+			}
+			if window.Baseline.Sensitivity == 0 {
+				window.Baseline.Sensitivity = 3
+			}
+			if math.IsNaN(window.Baseline.Sensitivity) || math.IsInf(window.Baseline.Sensitivity, 0) || window.Baseline.Sensitivity < 2 || window.Baseline.Sensitivity > 6 {
+				return errors.New("spec.window.baseline.sensitivity must be between 2 and 6")
+			}
+			if window.Duration.Value() < time.Minute || window.Duration.Value() > 24*time.Hour || window.Duration.Value()%time.Second != 0 {
+				return errors.New("baseline duration must be a whole-second interval between 1m and 24h")
+			}
+			if window.CountAtLeast != 0 || window.ClearBelow != 0 || window.RatioAtLeast != 0 || window.ClearRatio != 0 {
+				return errors.New("baseline rules cannot configure fixed count or ratio thresholds")
+			}
+		}
+		if rule.Spec.Kind != "baseline" && window.Baseline != nil {
+			return errors.New("spec.window.baseline is only supported by baseline rules")
 		}
 	}
 	if rule.Spec.Finding.Severity != "low" && rule.Spec.Finding.Severity != "medium" && rule.Spec.Finding.Severity != "high" && rule.Spec.Finding.Severity != "critical" {

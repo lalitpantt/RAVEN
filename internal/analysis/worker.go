@@ -175,10 +175,10 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 				resolutions[i].WindowSamples = append(resolutions[i].WindowSamples, makeWindowSample(rule, ownerType, ownerID, resolutions[i], observation, event, false, time.Now().UTC()))
 				continue
 			}
-			if rule.Spec.Kind != "event" && rule.Spec.Kind != "window" || observation.Kind != "normalized" {
+			if rule.Spec.Kind != "event" && rule.Spec.Kind != "window" && rule.Spec.Kind != "baseline" || observation.Kind != "normalized" {
 				continue
 			}
-			if rule.Spec.Kind == "window" {
+			if rule.Spec.Kind == "window" || rule.Spec.Kind == "baseline" {
 				categoryMatch := rule.Spec.SourceCategory == "" || rule.Spec.SourceCategory == event.Raven.SourceCategory
 				matched := categoryMatch && matchesRuleFields(rule, event.OCSF)
 				resolutions[i].WindowSamples = append(resolutions[i].WindowSamples, makeWindowSample(rule, ownerType, ownerID, resolutions[i], observation, event, matched, time.Now().UTC()))
@@ -227,7 +227,11 @@ func makeWindowSample(rule AnalysisRuleResource, ownerType, ownerID string, reso
 		sum := sha256.Sum256(encoded)
 		groupKey = hex.EncodeToString(sum[:])
 	}
-	return rawstore.AnalysisWindowSample{RuleID: rule.Metadata.Name, OwnerType: ownerType, OwnerID: ownerID, InstanceKey: rule.Metadata.Version + ":" + groupKey, EventID: observation.EventID, RawID: observation.RawID, Outcome: observation.Kind, SourceKey: resolution.SourceKey, DeviceID: resolution.DeviceID, RuleVersion: rule.Metadata.Version, Severity: rule.Spec.Finding.Severity, State: rule.Spec.Finding.State, Title: rule.Spec.Finding.Title, RecordOrdinal: observation.RecordOrdinal, CountAtLeast: rule.Spec.Window.CountAtLeast, ClearBelow: rule.Spec.Window.ClearBelow, Consecutive: rule.Spec.Window.Consecutive, RatioAtLeast: rule.Spec.Window.RatioAtLeast, ClearRatio: rule.Spec.Window.ClearRatio, Duration: rule.Spec.Window.Duration.Value(), For: rule.Spec.Finding.For.Value(), ClearAfter: rule.Spec.Finding.ClearAfter.Value(), OccurredAt: observation.OccurredAt, EvaluatedAt: now, Matched: matched}
+	baselineHistory := 0
+	if rule.Spec.Window.Baseline != nil {
+		baselineHistory = rule.Spec.Window.Baseline.MinimumHistory
+	}
+	return rawstore.AnalysisWindowSample{RuleID: rule.Metadata.Name, OwnerType: ownerType, OwnerID: ownerID, InstanceKey: rule.Metadata.Version + ":" + groupKey, EventID: observation.EventID, RawID: observation.RawID, Outcome: observation.Kind, SourceKey: resolution.SourceKey, DeviceID: resolution.DeviceID, RuleVersion: rule.Metadata.Version, Severity: rule.Spec.Finding.Severity, State: rule.Spec.Finding.State, Title: rule.Spec.Finding.Title, RecordOrdinal: observation.RecordOrdinal, CountAtLeast: rule.Spec.Window.CountAtLeast, ClearBelow: rule.Spec.Window.ClearBelow, Consecutive: rule.Spec.Window.Consecutive, BaselineMinimumHistory: baselineHistory, RatioAtLeast: rule.Spec.Window.RatioAtLeast, ClearRatio: rule.Spec.Window.ClearRatio, Duration: rule.Spec.Window.Duration.Value(), For: rule.Spec.Finding.For.Value(), ClearAfter: rule.Spec.Finding.ClearAfter.Value(), OccurredAt: observation.OccurredAt, EvaluatedAt: now, Matched: matched}
 }
 
 func (w *Worker) evaluateTimeRules(ctx context.Context, snapshot *Snapshot, rules []AnalysisRuleResource, now time.Time) error {
@@ -240,7 +244,7 @@ func (w *Worker) evaluateTimeRules(ctx context.Context, snapshot *Snapshot, rule
 	ids := make([]string, 0)
 	byID := make(map[string]AnalysisRuleResource)
 	for _, rule := range rules {
-		if (rule.Spec.Enabled == nil || *rule.Spec.Enabled) && (rule.Spec.Kind == "window" || rule.Spec.Kind == "quality") {
+		if (rule.Spec.Enabled == nil || *rule.Spec.Enabled) && (rule.Spec.Kind == "window" || rule.Spec.Kind == "quality" || rule.Spec.Kind == "baseline") {
 			ids = append(ids, rule.Metadata.Name)
 			byID[rule.Metadata.Name] = rule
 		}
@@ -270,6 +274,12 @@ func (w *Worker) evaluateTimeRules(ctx context.Context, snapshot *Snapshot, rule
 		if !strings.HasPrefix(c.InstanceKey, rule.Metadata.Version+":") {
 			continue
 		}
+		if rule.Spec.Kind == "baseline" {
+			if err := w.evaluateBaselineCandidate(ctx, snapshot, rule, c, now); err != nil {
+				return err
+			}
+			continue
+		}
 		sample := rawstore.AnalysisWindowSample{RuleID: rule.Metadata.Name, OwnerType: c.OwnerType, OwnerID: c.OwnerID, InstanceKey: c.InstanceKey, EventID: c.EventID, RawID: c.RawID, Outcome: c.Outcome, SourceKey: c.SourceKey, DeviceID: c.DeviceID, RuleVersion: rule.Metadata.Version, Severity: rule.Spec.Finding.Severity, State: rule.Spec.Finding.State, Title: rule.Spec.Finding.Title, RecordOrdinal: c.RecordOrdinal, CountAtLeast: rule.Spec.Window.CountAtLeast, ClearBelow: rule.Spec.Window.ClearBelow, Consecutive: rule.Spec.Window.Consecutive, RatioAtLeast: rule.Spec.Window.RatioAtLeast, ClearRatio: rule.Spec.Window.ClearRatio, Duration: rule.Spec.Window.Duration.Value(), For: rule.Spec.Finding.For.Value(), ClearAfter: rule.Spec.Finding.ClearAfter.Value(), OccurredAt: c.OccurredAt, EvaluatedAt: now, Matched: c.Matched}
 		items = append(items, rawstore.AnalysisDeadlineFinding{ObservationID: c.ObservationID, WindowSample: &sample})
 	}
@@ -277,6 +287,65 @@ func (w *Worker) evaluateTimeRules(ctx context.Context, snapshot *Snapshot, rule
 	w.windowCursor = candidates[len(candidates)-1].CursorID
 	w.mu.Unlock()
 	return w.store.ApplyAnalysisDeadlineFindings(ctx, items)
+}
+
+func (w *Worker) evaluateBaselineCandidate(ctx context.Context, snapshot *Snapshot, rule AnalysisRuleResource, candidate rawstore.AnalysisWindowCandidate, now time.Time) error {
+	window := rule.Spec.Window
+	interval := window.Duration.Value()
+	intervalEnd := now.UTC().Truncate(interval)
+	intervalStart := intervalEnd.Add(-interval)
+	series, err := w.store.ReadAnalysisBaselineSeries(ctx, rule.Metadata.Name, candidate.OwnerType, candidate.OwnerID, candidate.InstanceKey, intervalStart, intervalEnd, interval, window.Baseline.MinimumHistory)
+	if err != nil {
+		return err
+	}
+	historyCount := int(intervalStart.Sub(series.FirstSeenAt) / interval)
+	if historyCount < 0 {
+		historyCount = 0
+	}
+	if historyCount > window.Baseline.MinimumHistory {
+		historyCount = window.Baseline.MinimumHistory
+	}
+	state := rawstore.AnalysisBaselineState{
+		RuleID: rule.Metadata.Name, OwnerType: candidate.OwnerType, OwnerID: candidate.OwnerID, InstanceKey: candidate.InstanceKey,
+		Algorithm: baselineAlgorithm, AlgorithmVersion: "1", Status: "warming_up", MinimumHistory: window.Baseline.MinimumHistory,
+		HistoryCount: historyCount, FirstSeenAt: series.FirstSeenAt, IntervalStart: intervalStart, IntervalEnd: intervalEnd,
+		ObservedCount: series.Observed, UpdatedAt: now.UTC(),
+	}
+	if candidate.OwnerType == "device" {
+		if device, ok := snapshot.Device(candidate.OwnerID); ok && maintenanceUntil(device.Spec.Maintenance, now) != nil {
+			state.Status = "maintenance"
+			return w.store.ApplyAnalysisBaselineState(ctx, state, nil)
+		}
+	}
+	if historyCount < window.Baseline.MinimumHistory {
+		return w.store.ApplyAnalysisBaselineState(ctx, state, nil)
+	}
+	assessment, err := AssessRateBaseline(series.History, series.Observed, window.Baseline.MinimumHistory, window.Baseline.Sensitivity)
+	if err != nil {
+		return err
+	}
+	state.HistoryCount = assessment.HistoryCount
+	state.Median, state.MAD = assessment.Median, assessment.MAD
+	state.LowerThreshold, state.UpperThreshold = assessment.LowerThreshold, assessment.UpperThreshold
+	state.Direction = assessment.Direction
+	state.Status = "ready"
+	if assessment.Direction != "" {
+		state.Status = "anomaly"
+	}
+	if series.ObservationID == 0 {
+		return w.store.ApplyAnalysisBaselineState(ctx, state, nil)
+	}
+	finding := &rawstore.AnalysisBaselineFinding{ObservationID: series.ObservationID, Evaluation: rawstore.AnalysisFindingEvaluation{
+		RuleID: rule.Metadata.Name, RuleVersion: rule.Metadata.Version, OwnerType: candidate.OwnerType, OwnerID: candidate.OwnerID, InstanceKey: candidate.InstanceKey,
+		DeviceID: candidate.DeviceID, SourceKey: candidate.SourceKey, EventID: series.EventID, RawID: series.RawID, RecordOrdinal: series.RecordOrdinal,
+		OccurredAt: now.UTC(), ClearAfter: rule.Spec.Finding.ClearAfter.Value(), Severity: rule.Spec.Finding.Severity, State: rule.Spec.Finding.State, Title: rule.Spec.Finding.Title,
+	}}
+	if assessment.Direction != "" {
+		finding.Evaluation.Matched = true
+	} else {
+		finding.Evaluation.ClearMatched = true
+	}
+	return w.store.ApplyAnalysisBaselineState(ctx, state, finding)
 }
 
 func (w *Worker) evaluateHeartbeatDeadlines(ctx context.Context, snapshot *Snapshot, now time.Time) error {

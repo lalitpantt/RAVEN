@@ -1,0 +1,25 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: repeated-ssh-failures
+  version: 1.0.0
+  description: Detects repeated failed SSH logins from the simulator
+spec:
+  kind: window
+  sourceCategory: os
+  match:
+    fields:
+      - path: message
+        op: contains
+        value: Failed password
+  window:
+    signal: event_count
+    duration: 2m
+    countAtLeast: 3
+    clearBelow: 1
+  finding:
+    severity: high
+    state: yellow
+    title: Repeated SSH authentication failures
+    for: 2s
+    clearAfter: 10s

@@ -1,0 +1,23 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: firewall-blocked-traffic
+  version: 1.0.0
+  description: Raises a critical finding for blocked firewall simulator traffic
+spec:
+  kind: event
+  sourceCategory: network_device
+  match:
+    fields:
+      - path: action
+        op: in
+        value: [deny, drop]
+  clear:
+    - path: action
+      op: eq
+      value: allow
+  finding:
+    severity: critical
+    state: red
+    title: Firewall blocked suspicious traffic
+    clearAfter: 30s

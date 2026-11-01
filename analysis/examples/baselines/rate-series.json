@@ -1,0 +1,16 @@
+{
+  "algorithm": "rolling_median_mad_v1",
+  "minimum_history": 4,
+  "sensitivity": 3,
+  "cases": [
+    {"label": "ordinary steady variation", "history": [10, 9, 11, 10], "observed": 10, "expected": ""},
+    {"label": "injected event burst", "history": [10, 10, 11, 10], "observed": 24, "expected": "high"},
+    {"label": "injected event dropout", "history": [10, 10, 11, 10], "observed": 0, "expected": "low"},
+    {"label": "low-volume complete dropout", "history": [1, 1, 1, 1], "observed": 0, "expected": "low"},
+    {"label": "naturally quiet source", "history": [0, 0, 1, 0], "observed": 1, "expected": ""},
+    {"label": "unmodeled active-hour seasonal shift", "history": [2, 2, 2, 2], "observed": 12, "expected": "", "known_false_positive": true},
+    {"label": "noisy source variation", "history": [1, 20, 1, 20], "observed": 20, "expected": ""}
+  ],
+  "fixed_upper_threshold": 12,
+  "expected_metrics": {"rolling_false_positives": 1, "rolling_missed": 0, "fixed_false_positives": 1, "fixed_missed": 2}
+}

@@ -241,6 +241,9 @@ func applyAnalysisWindowSampleTx(ctx context.Context, tx *sql.Tx, observationID 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM analysis_window_samples WHERE occurred_at<? AND rowid IN (SELECT rowid FROM analysis_window_samples WHERE occurred_at<? LIMIT 1000)`, evaluatedAt.Add(-30*24*time.Hour).Format(time.RFC3339Nano), evaluatedAt.Add(-30*24*time.Hour).Format(time.RFC3339Nano)); err != nil {
 		return fmt.Errorf("prune expired analysis window samples: %w", err)
 	}
+	if sample.BaselineMinimumHistory > 0 {
+		return nil
+	}
 	var matchedCount, normalizedCount, quarantinedCount int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(matched),0),COALESCE(SUM(outcome='normalized'),0),COALESCE(SUM(outcome='quarantined'),0) FROM analysis_window_samples WHERE rule_id=? AND owner_type=? AND owner_id=? AND instance_key=? AND occurred_at>=?`, sample.RuleID, sample.OwnerType, sample.OwnerID, sample.InstanceKey, cutoff).Scan(&matchedCount, &normalizedCount, &quarantinedCount); err != nil {
 		return err
