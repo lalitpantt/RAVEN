@@ -190,6 +190,379 @@ func TestWorkerProjectsOnlyConfiguredHeartbeatMatches(t *testing.T) {
 	}
 }
 
+func TestWorkerFindingLifecycleIsIdempotentAndAuditable(t *testing.T) {
+	ctx := context.Background()
+	snapshot, err := LoadDirectory(filepath.Join("..", "..", "analysis", "examples"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "findings.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, err := NewWorker(store, snapshot.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.SetSnapshot(snapshot)
+	addEvent := func(id, activity string) {
+		t.Helper()
+		raw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.20.0.1", RawBytes: []byte(id), ReceivedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: id, RawID: raw.RawID, SourceCategory: "network_device", SourceID: "edge-router-01", ReceivedTime: raw.ReceivedAt}, OCSF: map[string]any{"activity_name": activity}}
+		if err := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"source_ip": "10.20.0.1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addEvent("event-interface-down", "interface_down")
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, total, err := store.ListAnalysisFindings(ctx, "all", 10, 0)
+	if err != nil || total != 1 || len(findings) != 1 || findings[0].Status != "open" || findings[0].OccurrenceCount != 1 || findings[0].DeviceID != "edge-router-01" {
+		t.Fatalf("open finding=%+v total=%d err=%v", findings, total, err)
+	}
+	id := findings[0].ID
+	if _, err := store.DB().ExecContext(ctx, `UPDATE analysis_worker_state SET checkpoint_id=0 WHERE singleton=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "all", 10, 0)
+	if err != nil || findings[0].OccurrenceCount != 1 {
+		t.Fatalf("replay duplicated finding: %+v err=%v", findings, err)
+	}
+	addEvent("event-interface-up", "interface_up")
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	finding, history, historyTotal, err := store.GetAnalysisFinding(ctx, id, 10, 0)
+	if err != nil || historyTotal != 2 || finding.Status != "clearing" || history[0].Action != "clear_started" {
+		t.Fatalf("clearing finding=%+v history=%+v total=%d err=%v", finding, history, historyTotal, err)
+	}
+	if resolved, err := store.ResolveMaturedAnalysisFindings(ctx, time.Now().Add(time.Minute), 10); err != nil || resolved != 1 {
+		t.Fatalf("mature finding count=%d err=%v", resolved, err)
+	}
+	finding, history, historyTotal, err = store.GetAnalysisFinding(ctx, id, 10, 0)
+	if err != nil || finding.Status != "resolved" || historyTotal != 3 || history[0].Action != "resolved" {
+		t.Fatalf("resolved finding=%+v history=%+v total=%d err=%v", finding, history, historyTotal, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE analysis_finding_history SET title='edited' WHERE finding_id=?`, id); err == nil {
+		t.Fatal("finding transition history was mutable")
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM analysis_finding_history WHERE finding_id=?`, id); err == nil {
+		t.Fatal("finding transition history was deletable")
+	}
+	addEvent("event-interface-down-again", "interface_down")
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	finding, history, historyTotal, err = store.GetAnalysisFinding(ctx, id, 10, 0)
+	if err != nil || finding.Status != "open" || finding.OccurrenceCount != 1 || historyTotal != 4 || history[0].Action != "opened" {
+		t.Fatalf("reopened finding=%+v history=%+v total=%d err=%v", finding, history, historyTotal, err)
+	}
+}
+
+func TestWorkerWindowRuleUsesConsecutiveMatchesAndExpiresBySharedSweep(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	writeConfig(t, directory, "devices", "edge.yaml", validDevice("edge-1"))
+	writeConfig(t, directory, "rules", "window.yaml", `apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata: {name: auth-burst, version: 1.0.0}
+spec:
+  kind: window
+  sourceCategory: network_device
+  match:
+    fields:
+      - {path: activity_name, op: eq, value: authentication_failure}
+  window:
+    signal: event_count
+    duration: 5m
+    groupBy: [src_endpoint.ip]
+    countAtLeast: 3
+    clearBelow: 1
+    consecutive: 2
+  finding: {severity: high, state: yellow, title: Authentication burst, for: 30s, clearAfter: 10s}
+`)
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "window.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, err := NewWorker(store, snapshot.Resolver())
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.SetSnapshot(snapshot)
+	appendEvent := func(id, activity string, at time.Time) {
+		t.Helper()
+		raw, e := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.0.0.1", RawBytes: []byte(id), ReceivedAt: at})
+		if e != nil {
+			t.Fatal(e)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: id, RawID: raw.RawID, SourceCategory: "network_device", ReceivedTime: at}, OCSF: map[string]any{"activity_name": activity, "src_endpoint": map[string]any{"ip": "192.0.2.1"}}}
+		if e := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"syslog_host": "edge-1.example.internal"}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	for i := 0; i < 3; i++ {
+		appendEvent(fmt.Sprintf("window-fail-%d", i), "authentication_failure", base.Add(time.Duration(i)*15*time.Second))
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if findings, total, err := store.ListAnalysisFindings(ctx, "open", 10, 0); err != nil || total != 0 {
+		t.Fatalf("window rule ignored its for duration: findings=%+v total=%d err=%v", findings, total, err)
+	}
+	for range 2 {
+		if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), time.Now().UTC().Add(31*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	findings, total, err := store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || total != 1 || len(findings) != 1 || findings[0].RuleID != "auth-burst" {
+		t.Fatalf("window finding=%+v total=%d err=%v", findings, total, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE analysis_worker_state SET checkpoint_id=0 WHERE singleton=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "open", 10, 0)
+	var sampleCount int
+	if queryErr := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_window_samples WHERE rule_id='auth-burst'`).Scan(&sampleCount); queryErr != nil || err != nil || len(findings) != 1 || findings[0].OccurrenceCount != 1 || sampleCount != 3 {
+		t.Fatalf("window replay duplicated state: findings=%+v samples=%d listErr=%v queryErr=%v", findings, sampleCount, err, queryErr)
+	}
+	appendEvent("window-success", "authentication_success", time.Now().UTC())
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("a count between clear and trigger thresholds cleared the finding: %+v err=%v", findings, err)
+	}
+	future := time.Now().UTC().Add(7 * time.Minute)
+	if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), future); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), future); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "clearing", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("expired window did not begin recovery hold: %+v err=%v", findings, err)
+	}
+	if resolved, err := store.ResolveMaturedAnalysisFindings(ctx, future.Add(11*time.Second), 20); err != nil || resolved != 1 {
+		t.Fatalf("window recovery resolved=%d err=%v", resolved, err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "resolved", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("resolved window finding=%+v err=%v", findings, err)
+	}
+}
+
+func TestWorkerQualityRuleUsesCompletedOutcomesAndHysteresis(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	writeConfig(t, directory, "rules", "quality.yaml", `apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata: {name: quarantine-ratio, version: 1.0.0}
+spec:
+  kind: quality
+  match: {fields: []}
+  window: {signal: quarantine_ratio, duration: 5m, ratioAtLeast: 0.5, clearRatio: 0.2}
+  finding: {severity: high, state: yellow, title: Source quality degraded, clearAfter: 10s}
+`)
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "quality.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, _ := NewWorker(store, snapshot.Resolver())
+	worker.SetSnapshot(snapshot)
+	const sourceIP = "192.0.2.44"
+	quarantine := func(id string) {
+		t.Helper()
+		raw, e := store.Store(ctx, model.IngestedRecord{Transport: "http_post", SourceIP: sourceIP, RawBytes: []byte(id), ReceivedAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		e = store.QuarantineChild(ctx, model.QuarantineEntry{QuarantineID: id, RawID: raw.RawID, RawSHA256: raw.RawSHA256, Stage: "normalize", Reason: "fixture", QuarantinedAt: time.Now().UTC(), AnalysisHints: model.AnalysisIdentityHints{"source_ip": sourceIP}})
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	normalized := func(id string) {
+		t.Helper()
+		raw, e := store.Store(ctx, model.IngestedRecord{Transport: "http_post", SourceIP: sourceIP, RawBytes: []byte(id), ReceivedAt: time.Now().UTC()})
+		if e != nil {
+			t.Fatal(e)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: id, RawID: raw.RawID, ReceivedTime: raw.ReceivedAt}, OCSF: map[string]any{"activity_name": "ok"}}
+		if e := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"source_ip": sourceIP}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	quarantine("quality-bad-1")
+	normalized("quality-good-1")
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, total, err := store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || total != 1 || len(findings) != 1 || findings[0].RuleID != "quarantine-ratio" {
+		t.Fatalf("quality finding=%+v total=%d err=%v", findings, total, err)
+	}
+	for i := 0; i < 10; i++ {
+		normalized(fmt.Sprintf("quality-good-%d", i+2))
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "clearing", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("quality ratio below clear threshold did not recover: %+v err=%v", findings, err)
+	}
+	if resolved, err := store.ResolveMaturedAnalysisFindings(ctx, time.Now().Add(time.Minute), 20); err != nil || resolved != 1 {
+		t.Fatalf("quality finding resolve=%d err=%v", resolved, err)
+	}
+}
+
+func TestWorkerHeartbeatDeadlineEscalatesRecoversAndHonorsMaintenance(t *testing.T) {
+	ctx := context.Background()
+	directory := t.TempDir()
+	device := heartbeatDevice("pulse")
+	device = strings.Replace(device, "      - edge-1.example.internal", "      - edge-1.example.internal\n    source_ip:\n      - 10.0.0.8", 1)
+	writeConfig(t, directory, "devices", "edge.yaml", device)
+	writeConfig(t, directory, "rules", "heartbeat.yaml", heartbeatRule("pulse"))
+	snapshot, err := LoadDirectory(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := rawstore.New(filepath.Join(t.TempDir(), "heartbeat-deadline.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetAnalysisEnabled(true)
+	worker, _ := NewWorker(store, snapshot.Resolver())
+	worker.SetSnapshot(snapshot)
+	appendHeartbeat := func(id string, at time.Time) {
+		t.Helper()
+		raw, e := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.0.0.8", RawBytes: []byte(id), ReceivedAt: at})
+		if e != nil {
+			t.Fatal(e)
+		}
+		event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: id, RawID: raw.RawID, SourceCategory: "network_device", ReceivedTime: at}, OCSF: map[string]any{"activity_name": "heartbeat"}}
+		if e := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"syslog_host": "edge-1.example.internal"}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	last := time.Now().UTC()
+	appendHeartbeat("deadline-heartbeat-old", last)
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := store.ListAnalysisHeartbeatEvidence(ctx, "", 1)
+	if err != nil || len(evidence) != 1 {
+		t.Fatalf("heartbeat evidence page=%+v err=%v", evidence, err)
+	}
+	if next, err := store.ListAnalysisHeartbeatEvidence(ctx, evidence[0].DeviceID, 1); err != nil || len(next) != 0 {
+		t.Fatalf("heartbeat evidence pagination returned %+v err=%v", next, err)
+	}
+	last = evidence[0].OccurredAt
+	warningAt := last.Add(2 * time.Minute)
+	for range 2 {
+		if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), warningAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	findings, _, err := store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || len(findings) != 1 || findings[0].State != "yellow" {
+		t.Fatalf("warning deadline finding=%+v err=%v", findings, err)
+	}
+	criticalAt := last.Add(5 * time.Minute)
+	for range 2 {
+		if err := worker.evaluateTimeRules(ctx, snapshot, snapshot.Rules(), criticalAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || len(findings) != 1 || findings[0].Severity != "critical" || findings[0].State != "red" {
+		t.Fatalf("critical deadline finding=%+v err=%v", findings, err)
+	}
+	appendHeartbeat("deadline-heartbeat-fresh", time.Now().UTC())
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = store.ListAnalysisFindings(ctx, "resolved", 10, 0)
+	if err != nil || len(findings) != 1 {
+		t.Fatalf("fresh heartbeat did not resolve deadline finding=%+v err=%v", findings, err)
+	}
+
+	maintenanceAt := time.Now().UTC().Truncate(time.Hour).Add(time.Hour + 2*time.Minute)
+	start, end := maintenanceAt.Add(-time.Minute), maintenanceAt.Add(5*time.Minute)
+	maintenanceDevice := strings.Replace(device, "  reporting:", fmt.Sprintf("  maintenance:\n    timeZone: UTC\n    windows:\n      - weekdays: [%s]\n        start: %s\n        end: %s\n  reporting:", weekday(maintenanceAt.Weekday()), start.Format("15:04"), end.Format("15:04")), 1)
+	maintenanceDir := t.TempDir()
+	writeConfig(t, maintenanceDir, "devices", "edge.yaml", maintenanceDevice)
+	writeConfig(t, maintenanceDir, "rules", "heartbeat.yaml", heartbeatRule("pulse"))
+	maintenanceSnapshot, err := LoadDirectory(maintenanceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maintenanceStore, err := rawstore.New(filepath.Join(t.TempDir(), "heartbeat-maintenance.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenanceStore.Close()
+	maintenanceStore.SetAnalysisEnabled(true)
+	maintenanceWorker, _ := NewWorker(maintenanceStore, maintenanceSnapshot.Resolver())
+	maintenanceWorker.SetSnapshot(maintenanceSnapshot)
+	old := maintenanceAt.Add(-4 * time.Minute)
+	raw, e := maintenanceStore.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.0.0.8", RawBytes: []byte("maintenance-old"), ReceivedAt: old})
+	if e != nil {
+		t.Fatal(e)
+	}
+	event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: "maintenance-heartbeat-old", RawID: raw.RawID, SourceCategory: "network_device", ReceivedTime: old}, OCSF: map[string]any{"activity_name": "heartbeat"}}
+	if err := maintenanceStore.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"syslog_host": "edge-1.example.internal"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := maintenanceWorker.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := maintenanceWorker.evaluateTimeRules(ctx, maintenanceSnapshot, maintenanceSnapshot.Rules(), maintenanceAt); err != nil {
+		t.Fatal(err)
+	}
+	findings, total, err := maintenanceStore.ListAnalysisFindings(ctx, "all", 10, 0)
+	if err != nil || total != 0 {
+		t.Fatalf("maintenance failed to suppress missing-report finding: %+v total=%d err=%v", findings, total, err)
+	}
+	if err := maintenanceWorker.evaluateTimeRules(ctx, maintenanceSnapshot, maintenanceSnapshot.Rules(), end.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	findings, _, err = maintenanceStore.ListAnalysisFindings(ctx, "open", 10, 0)
+	if err != nil || len(findings) != 1 || findings[0].State != "red" {
+		t.Fatalf("stale heartbeat did not alert after maintenance: %+v err=%v", findings, err)
+	}
+}
+
 func TestWorkerBatchProjectionAndCheckpointRollbackTogether(t *testing.T) {
 	ctx := context.Background()
 	store, err := rawstore.New(filepath.Join(t.TempDir(), "rollback.db"))

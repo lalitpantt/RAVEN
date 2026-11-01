@@ -3,18 +3,49 @@ package analysis
 import (
 	"reflect"
 	"strings"
+
+	"raven/internal/model"
 )
 
-// matchesRuleFields evaluates a validated rule against normalized OCSF fields.
-// It is used for the configured heartbeat signal; findings remain an A-04 concern.
-func matchesRuleFields(rule AnalysisRuleResource, fields map[string]any) bool {
-	for _, condition := range rule.Spec.Match.Fields {
-		value, ok := lookupField(fields, condition.Path)
-		if !ok || !matchesCondition(condition, value) {
-			return false
-		}
+type EventRuleEvaluation struct {
+	Matched       bool     `json:"matched"`
+	ClearMatched  bool     `json:"clear_matched"`
+	MatchedFields []string `json:"matched_fields"`
+	ClearFields   []string `json:"clear_fields"`
+}
+
+// EvaluateEventRule evaluates one validated event rule against normalized fields.
+func EvaluateEventRule(rule AnalysisRuleResource, event *model.NormalizedEvent) EventRuleEvaluation {
+	if event == nil || rule.Spec.Kind != "event" || (rule.Spec.Enabled != nil && !*rule.Spec.Enabled) {
+		return EventRuleEvaluation{}
 	}
-	return true
+	if rule.Spec.SourceCategory != "" && rule.Spec.SourceCategory != event.Raven.SourceCategory {
+		return EventRuleEvaluation{}
+	}
+	matched, matchedFields := evaluateConditions(rule.Spec.Match.Fields, event.OCSF)
+	cleared, clearFields := evaluateConditions(rule.Spec.Clear, event.OCSF)
+	return EventRuleEvaluation{Matched: matched, ClearMatched: cleared, MatchedFields: matchedFields, ClearFields: clearFields}
+}
+
+// matchesRuleFields evaluates a heartbeat rule against normalized OCSF fields.
+func matchesRuleFields(rule AnalysisRuleResource, fields map[string]any) bool {
+	matched, _ := evaluateConditions(rule.Spec.Match.Fields, fields)
+	return matched
+}
+
+func evaluateConditions(conditions []FieldCondition, fields map[string]any) (bool, []string) {
+	if len(conditions) == 0 {
+		return false, nil
+	}
+	matchedFields := make([]string, 0, len(conditions))
+	for _, condition := range conditions {
+		actual, ok := lookupField(fields, condition.Path)
+		if !ok || !matchesCondition(condition, actual) {
+			return false, nil
+		}
+		matchedFields = append(matchedFields, condition.Path)
+	}
+	return true, matchedFields
 }
 
 func lookupField(fields map[string]any, path string) (any, bool) {

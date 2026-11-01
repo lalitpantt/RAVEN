@@ -13,7 +13,7 @@ func TestLoadDirectoryValidatesExamplesAndKeepsSnapshotImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.Enabled() || snapshot.DeviceCount() != 2 || snapshot.RuleCount() != 2 {
+	if !snapshot.Enabled() || snapshot.DeviceCount() != 2 || snapshot.RuleCount() != 4 {
 		t.Fatalf("unexpected example snapshot: enabled=%v devices=%d rules=%d", snapshot.Enabled(), snapshot.DeviceCount(), snapshot.RuleCount())
 	}
 	rule, ok := snapshot.Rule("interface-down")

@@ -93,7 +93,7 @@ func New(dbPath string) (*RawStore, error) {
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 10
+const CurrentSchemaVersion = 12
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -478,6 +478,131 @@ func migrateSchema(db sqlExecutor) error {
 			return fmt.Errorf("failed to create analysis rate schema v10: %w", err)
 		}
 		version = 10
+	}
+
+	if version < 11 {
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS analysis_findings (
+			finding_id TEXT PRIMARY KEY CHECK(length(finding_id)=64),
+			owner_type TEXT NOT NULL CHECK(owner_type IN ('device','source')),
+			owner_id TEXT NOT NULL,
+			device_id TEXT,
+			source_key TEXT NOT NULL CHECK(length(source_key)=64),
+			rule_id TEXT NOT NULL,
+			rule_version TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('open','clearing','resolved')),
+			severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+			state TEXT NOT NULL CHECK(state IN ('yellow','red')),
+			title TEXT NOT NULL,
+			first_seen_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			last_event_id TEXT NOT NULL,
+			last_raw_id TEXT NOT NULL,
+			record_ordinal INTEGER NOT NULL CHECK(record_ordinal BETWEEN 0 AND 2147483647),
+			occurrence_count INTEGER NOT NULL CHECK(occurrence_count>0),
+			clear_since TEXT,
+			clear_deadline TEXT,
+			clear_observation_id INTEGER,
+			clear_event_id TEXT,
+			clear_raw_id TEXT,
+			clear_ordinal INTEGER,
+			resolved_at TEXT,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_findings_status_updated ON analysis_findings(status,updated_at DESC);
+		CREATE TABLE IF NOT EXISTS analysis_finding_history (
+			history_id INTEGER PRIMARY KEY,
+			finding_id TEXT NOT NULL,
+			observation_id INTEGER NOT NULL,
+			action TEXT NOT NULL CHECK(action IN ('opened','updated','clear_started','clear_cancelled','resolved')),
+			occurred_at TEXT NOT NULL,
+			event_id TEXT NOT NULL,
+			raw_id TEXT NOT NULL,
+			record_ordinal INTEGER NOT NULL,
+			rule_version TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			state TEXT NOT NULL,
+			title TEXT NOT NULL,
+			UNIQUE(finding_id,observation_id,action),
+			FOREIGN KEY(finding_id) REFERENCES analysis_findings(finding_id),
+			FOREIGN KEY(observation_id) REFERENCES analysis_observations(observation_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_analysis_finding_history ON analysis_finding_history(finding_id,history_id DESC);
+		CREATE TRIGGER IF NOT EXISTS analysis_finding_history_no_update BEFORE UPDATE ON analysis_finding_history BEGIN SELECT RAISE(ABORT,'analysis finding history is immutable'); END;
+		CREATE TRIGGER IF NOT EXISTS analysis_finding_history_no_delete BEFORE DELETE ON analysis_finding_history BEGIN SELECT RAISE(ABORT,'analysis finding history is immutable'); END;`); err != nil {
+			return fmt.Errorf("failed to create analysis finding schema v11: %w", err)
+		}
+		version = 11
+	}
+
+	if version < 12 {
+		var historySchema sql.NullString
+		if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='analysis_finding_history'`).Scan(&historySchema); err != nil {
+			return fmt.Errorf("inspect finding history for schema v12: %w", err)
+		}
+		if strings.Contains(historySchema.String, "UNIQUE(finding_id,observation_id,action)") {
+			if _, err := db.Exec(`DROP TRIGGER IF EXISTS analysis_finding_history_no_update;
+				DROP TRIGGER IF EXISTS analysis_finding_history_no_delete;
+				ALTER TABLE analysis_finding_history RENAME TO analysis_finding_history_v11;
+				CREATE TABLE analysis_finding_history (
+					history_id INTEGER PRIMARY KEY,
+					finding_id TEXT NOT NULL,
+					observation_id INTEGER NOT NULL,
+					action TEXT NOT NULL CHECK(action IN ('opened','updated','clear_started','clear_cancelled','resolved','escalated')),
+					occurred_at TEXT NOT NULL,
+					event_id TEXT NOT NULL,
+					raw_id TEXT NOT NULL,
+					record_ordinal INTEGER NOT NULL,
+					rule_version TEXT NOT NULL,
+					severity TEXT NOT NULL,
+					state TEXT NOT NULL,
+					title TEXT NOT NULL,
+					FOREIGN KEY(finding_id) REFERENCES analysis_findings(finding_id),
+					FOREIGN KEY(observation_id) REFERENCES analysis_observations(observation_id)
+				);
+				INSERT INTO analysis_finding_history SELECT * FROM analysis_finding_history_v11;
+				DROP TABLE analysis_finding_history_v11;
+				CREATE INDEX IF NOT EXISTS idx_analysis_finding_history ON analysis_finding_history(finding_id,history_id DESC);
+				CREATE TRIGGER analysis_finding_history_no_update BEFORE UPDATE ON analysis_finding_history BEGIN SELECT RAISE(ABORT,'analysis finding history is immutable'); END;
+				CREATE TRIGGER analysis_finding_history_no_delete BEFORE DELETE ON analysis_finding_history BEGIN SELECT RAISE(ABORT,'analysis finding history is immutable'); END;`); err != nil {
+				return fmt.Errorf("upgrade finding history for schema v12: %w", err)
+			}
+		}
+		for _, column := range []struct{ table, name, ddl string }{
+			{"analysis_findings", "instance_key", `ALTER TABLE analysis_findings ADD COLUMN instance_key TEXT NOT NULL DEFAULT ''`},
+			{"analysis_device_telemetry", "last_heartbeat_observation_id", `ALTER TABLE analysis_device_telemetry ADD COLUMN last_heartbeat_observation_id INTEGER NOT NULL DEFAULT 0`},
+		} {
+			var exists int
+			if err := db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=?", column.table), column.name).Scan(&exists); err != nil {
+				return fmt.Errorf("inspect schema v12 column %s.%s: %w", column.table, column.name, err)
+			}
+			if exists == 0 {
+				if _, err := db.Exec(column.ddl); err != nil {
+					return fmt.Errorf("add schema v12 column %s.%s: %w", column.table, column.name, err)
+				}
+			}
+		}
+		if _, err := db.Exec(`UPDATE analysis_device_telemetry SET last_heartbeat_observation_id=COALESCE((SELECT MAX(o.observation_id) FROM analysis_observations o JOIN analysis_observation_sources aos ON aos.observation_id=o.observation_id WHERE aos.device_id=analysis_device_telemetry.device_id AND o.kind='normalized' AND o.occurred_at=analysis_device_telemetry.last_heartbeat_at),0) WHERE heartbeat_count>0;
+			CREATE TABLE IF NOT EXISTS analysis_window_samples (
+				rule_id TEXT NOT NULL,
+				owner_type TEXT NOT NULL CHECK(owner_type IN ('device','source')),
+				owner_id TEXT NOT NULL,
+				instance_key TEXT NOT NULL,
+				observation_id INTEGER NOT NULL,
+				occurred_at TEXT NOT NULL,
+				matched INTEGER NOT NULL CHECK(matched IN (0,1)),
+				outcome TEXT NOT NULL CHECK(outcome IN ('normalized','quarantined')),
+				event_id TEXT NOT NULL,
+				raw_id TEXT NOT NULL,
+				record_ordinal INTEGER NOT NULL,
+				PRIMARY KEY(rule_id,observation_id),
+				FOREIGN KEY(observation_id) REFERENCES analysis_observations(observation_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_analysis_window_samples ON analysis_window_samples(rule_id,owner_type,owner_id,instance_key,occurred_at);
+			CREATE INDEX IF NOT EXISTS idx_analysis_window_retention ON analysis_window_samples(occurred_at);
+			CREATE INDEX IF NOT EXISTS idx_analysis_findings_instance ON analysis_findings(rule_id,owner_type,owner_id,instance_key,status);`); err != nil {
+			return fmt.Errorf("create analysis window schema v12: %w", err)
+		}
+		version = 12
 	}
 
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {

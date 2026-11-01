@@ -99,7 +99,26 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 	defer store.Close()
 	defer pipe.Stop()
-	snapshot, err := analysis.LoadDirectory(filepath.Join("..", "..", "analysis", "examples"))
+	analysisDir := filepath.Join(tempDir, "analysis")
+	for _, resource := range []string{
+		"devices/app-server-01.yaml",
+		"devices/edge-router-01.yaml",
+		"rules/device-heartbeat.yaml",
+		"rules/interface-down.yaml",
+	} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "analysis", "examples", resource))
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination := filepath.Join(analysisDir, resource)
+		if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := analysis.LoadDirectory(analysisDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +140,14 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	}
 	event := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: "api-analysis-heartbeat", RawID: raw.RawID, SourceCategory: "network_device", SourceID: "edge-router-01", ReceivedTime: raw.ReceivedAt}, OCSF: map[string]any{"activity_name": "heartbeat"}}
 	if err := store.StoreNormalizedWithOutboxAndHints(ctx, event, nil, model.AnalysisIdentityHints{"source_ip": "10.20.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	downRaw, err := store.Store(ctx, model.IngestedRecord{Transport: "syslog_udp", SourceIP: "10.20.0.1", RawBytes: []byte("interface down"), ReceivedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	downEvent := &model.NormalizedEvent{Raven: model.RavenEnvelope{EventID: "api-analysis-interface-down", RawID: downRaw.RawID, SourceCategory: "network_device", SourceID: "edge-router-01", ReceivedTime: downRaw.ReceivedAt}, OCSF: map[string]any{"activity_name": "interface_down"}}
+	if err := store.StoreNormalizedWithOutboxAndHints(ctx, downEvent, nil, model.AnalysisIdentityHints{"source_ip": "10.20.0.1"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Store(ctx, model.IngestedRecord{Transport: "http_post", SourceIP: "192.0.2.44", RawBytes: []byte("unassigned"), ReceivedAt: time.Now().UTC()}); err != nil {
@@ -175,7 +202,7 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 		t.Fatalf("paginated device response: %d %s", devices.Code, devices.Body.String())
 	}
 	first := request("/api/v1/analysis/devices?limit=1&offset=1")
-	if !strings.Contains(first.Body.String(), `"device_id":"edge-router-01"`) || !strings.Contains(first.Body.String(), `"state":"green"`) || !strings.Contains(first.Body.String(), `"heartbeat_count":1`) || !strings.Contains(first.Body.String(), `"normalized_per_minute":0.2`) {
+	if !strings.Contains(first.Body.String(), `"device_id":"edge-router-01"`) || !strings.Contains(first.Body.String(), `"state":"green"`) || !strings.Contains(first.Body.String(), `"heartbeat_count":1`) || !strings.Contains(first.Body.String(), `"normalized_per_minute":0.4`) {
 		t.Fatalf("heartbeat device projection: %s", first.Body.String())
 	}
 	unassigned := request("/api/v1/analysis/sources?resolution=unassigned&limit=10")
@@ -184,6 +211,25 @@ func TestAPI_AnalysisReadOnlyTelemetryEndpoints(t *testing.T) {
 	}
 	if invalid := request("/api/v1/analysis/devices?limit=501"); invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid page limit status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	findings := request("/api/v1/analysis/findings?status=open")
+	if findings.Code != http.StatusOK || !strings.Contains(findings.Body.String(), `"rule_id":"interface-down"`) || !strings.Contains(findings.Body.String(), `"total":1`) {
+		t.Fatalf("read-only findings list: %d %s", findings.Code, findings.Body.String())
+	}
+	var findingResponse struct {
+		Findings []struct {
+			ID string `json:"id"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal(findings.Body.Bytes(), &findingResponse); err != nil || len(findingResponse.Findings) != 1 {
+		t.Fatalf("decode finding list: %+v err=%v", findingResponse, err)
+	}
+	detail := request("/api/v1/analysis/findings/" + findingResponse.Findings[0].ID)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), "/api/v1/events/api-analysis-interface-down/trace") || !strings.Contains(detail.Body.String(), "/api/v1/events/api-analysis-interface-down/verify") {
+		t.Fatalf("finding evidence links: %d %s", detail.Code, detail.Body.String())
+	}
+	if invalid := request("/api/v1/analysis/findings?status=active"); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid findings status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 	if legacy := request("/api/v1/sources"); legacy.Code != http.StatusOK || !strings.Contains(legacy.Body.String(), `"sources"`) {
 		t.Fatalf("existing source API changed: %d %s", legacy.Code, legacy.Body.String())

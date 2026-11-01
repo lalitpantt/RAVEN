@@ -128,9 +128,14 @@ type compiledCondition struct {
 }
 
 type RuleWindow struct {
+	Signal       string   `yaml:"signal" json:"signal"`
 	Duration     Duration `yaml:"duration" json:"duration"`
 	GroupBy      []string `yaml:"groupBy" json:"groupBy"`
-	CountAtLeast int      `yaml:"countAtLeast" json:"countAtLeast"`
+	CountAtLeast int      `yaml:"countAtLeast,omitempty" json:"countAtLeast,omitempty"`
+	ClearBelow   int      `yaml:"clearBelow,omitempty" json:"clearBelow,omitempty"`
+	RatioAtLeast float64  `yaml:"ratioAtLeast,omitempty" json:"ratioAtLeast,omitempty"`
+	ClearRatio   float64  `yaml:"clearRatio,omitempty" json:"clearRatio,omitempty"`
+	Consecutive  int      `yaml:"consecutive,omitempty" json:"consecutive,omitempty"`
 }
 
 type FindingSpec struct {
@@ -598,16 +603,21 @@ func validateRule(rule *AnalysisRuleResource) error {
 	if rule.Spec.SourceCategory != "" && !packs.KnownSourceCategories[rule.Spec.SourceCategory] {
 		return fmt.Errorf("unsupported spec.sourceCategory %q", rule.Spec.SourceCategory)
 	}
-	if err := validateConditions(rule.Spec.Match.Fields, "spec.match.fields", &rule.Spec.compiled, false); err != nil {
-		return err
+	if rule.Spec.Kind != "quality" || len(rule.Spec.Match.Fields) > 0 {
+		if err := validateConditions(rule.Spec.Match.Fields, "spec.match.fields", &rule.Spec.compiled, false); err != nil {
+			return err
+		}
 	}
 	if len(rule.Spec.Clear) > 0 {
 		if err := validateConditions(rule.Spec.Clear, "spec.clear", &rule.Spec.compiled, true); err != nil {
 			return err
 		}
 	}
-	if rule.Spec.Kind != "heartbeat" && len(rule.Spec.Clear) == 0 {
-		return errors.New("non-heartbeat rules require an explicit spec.clear condition")
+	if rule.Spec.Kind == "event" && len(rule.Spec.Clear) == 0 {
+		return errors.New("event rules require an explicit spec.clear condition")
+	}
+	if (rule.Spec.Kind == "window" || rule.Spec.Kind == "quality") && len(rule.Spec.Clear) != 0 {
+		return errors.New("window and quality rules use spec.window clear thresholds instead of spec.clear")
 	}
 	if rule.Spec.Kind != "heartbeat" && rule.Spec.Finding.ClearAfter == 0 {
 		return errors.New("non-heartbeat rules require spec.finding.clearAfter")
@@ -616,15 +626,53 @@ func validateRule(rule *AnalysisRuleResource) error {
 		if err := validateDuration("spec.window.duration", rule.Spec.Window.Duration, true); err != nil {
 			return err
 		}
-		if rule.Spec.Window.CountAtLeast < 1 || rule.Spec.Window.CountAtLeast > 1_000_000_000 {
-			return errors.New("spec.window.countAtLeast must be between 1 and 1000000000")
-		}
 		if len(rule.Spec.Window.GroupBy) > 16 {
 			return errors.New("spec.window.groupBy may contain at most 16 fields")
 		}
 		for _, path := range rule.Spec.Window.GroupBy {
 			if !validFieldPath(path) {
 				return fmt.Errorf("invalid spec.window.groupBy path %q", path)
+			}
+		}
+		window := rule.Spec.Window
+		if window.Consecutive == 0 {
+			window.Consecutive = 1
+		}
+		if window.Consecutive < 1 || window.Consecutive > 1000 {
+			return errors.New("spec.window.consecutive must be between 1 and 1000")
+		}
+		switch rule.Spec.Kind {
+		case "window":
+			if window.Signal != "event_count" {
+				return errors.New("window rules require signal event_count")
+			}
+			if len(rule.Spec.Match.Fields) == 0 {
+				return errors.New("window rules require spec.match.fields")
+			}
+			if window.CountAtLeast < 1 || window.CountAtLeast > 5000 {
+				return errors.New("spec.window.countAtLeast must be between 1 and 5000")
+			}
+			if window.ClearBelow < 0 || window.ClearBelow >= window.CountAtLeast {
+				return errors.New("spec.window.clearBelow must be less than countAtLeast")
+			}
+			if window.RatioAtLeast != 0 || window.ClearRatio != 0 {
+				return errors.New("event_count rules cannot configure ratio thresholds")
+			}
+		case "quality":
+			if window.Signal != "quarantine_ratio" {
+				return errors.New("quality rules require signal quarantine_ratio")
+			}
+			if rule.Spec.SourceCategory != "" {
+				return errors.New("quality rules cannot filter sourceCategory because quarantined records have no normalized category")
+			}
+			if len(window.GroupBy) != 0 {
+				return errors.New("quality rules group by resolved source identity and do not accept groupBy")
+			}
+			if window.RatioAtLeast <= 0 || window.RatioAtLeast > 1 || window.ClearRatio < 0 || window.ClearRatio >= window.RatioAtLeast {
+				return errors.New("quality thresholds require 0 <= clearRatio < ratioAtLeast <= 1")
+			}
+			if window.CountAtLeast != 0 || window.ClearBelow != 0 {
+				return errors.New("quality rules cannot configure count thresholds")
 			}
 		}
 	}

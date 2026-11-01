@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -181,6 +182,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/analysis/status", s.handleAnalysisStatus)
 	mux.HandleFunc("GET /api/v1/analysis/devices", s.handleAnalysisDevices)
 	mux.HandleFunc("GET /api/v1/analysis/sources", s.handleAnalysisSources)
+	mux.HandleFunc("GET /api/v1/analysis/findings", s.handleAnalysisFindings)
+	mux.HandleFunc("GET /api/v1/analysis/findings/{id}", s.handleAnalysisFinding)
 	mux.HandleFunc("GET /api/v1/packs", s.handleListPacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs", s.handleMarketplacePacks)
 	mux.HandleFunc("GET /api/v1/marketplace/packs/{name}", s.handleMarketplacePack)
@@ -804,6 +807,47 @@ func (s *Server) handleAnalysisSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.jsonResponse(w, http.StatusOK, map[string]any{"sources": sources, "resolution": resolution, "total": count, "limit": limit, "offset": offset})
+}
+
+func (s *Server) handleAnalysisFindings(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := s.analysisPagination(w, r)
+	if !ok {
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status == "" {
+		status = "open"
+	}
+	findings, total, err := s.store.ListAnalysisFindings(r.Context(), status, limit, offset)
+	if err != nil {
+		s.jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{"findings": findings, "status": status, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) handleAnalysisFinding(w http.ResponseWriter, r *http.Request) {
+	limit, offset, ok := s.analysisPagination(w, r)
+	if !ok {
+		return
+	}
+	finding, history, total, err := s.store.GetAnalysisFinding(r.Context(), r.PathValue("id"), limit, offset)
+	if errors.Is(err, sql.ErrNoRows) {
+		s.jsonError(w, http.StatusNotFound, "analysis finding not found")
+		return
+	}
+	if err != nil {
+		s.jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	eventPath := "/api/v1/events/" + url.PathEscape(finding.LastEventID)
+	evidence := map[string]string{"event": eventPath, "trace": eventPath + "/trace", "verify": eventPath + "/verify", "raw": "/api/v1/raw/" + url.PathEscape(finding.LastRawID)}
+	historyEvidence := make([]map[string]any, 0, len(history))
+	for _, item := range history {
+		eventPath := "/api/v1/events/" + url.PathEscape(item.EventID)
+		historyEvidence = append(historyEvidence, map[string]any{"history": item, "evidence": map[string]string{"event": eventPath, "trace": eventPath + "/trace", "verify": eventPath + "/verify", "raw": "/api/v1/raw/" + url.PathEscape(item.RawID)}})
+	}
+	s.jsonResponse(w, http.StatusOK, map[string]any{"finding": finding, "evidence": evidence, "history": historyEvidence, "history_total": total, "limit": limit, "offset": offset})
 }
 
 func (s *Server) analysisPagination(w http.ResponseWriter, r *http.Request) (int, int, bool) {

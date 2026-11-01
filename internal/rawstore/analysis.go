@@ -38,6 +38,25 @@ type AnalysisResolution struct {
 	MatchMethod   string
 	Confidence    string
 	HeartbeatRule string
+	Findings      []AnalysisFindingEvaluation
+	WindowSamples []AnalysisWindowSample
+}
+
+type AnalysisWindowSample struct {
+	RuleID, OwnerType, OwnerID, InstanceKey, EventID, RawID, Outcome string
+	SourceKey, DeviceID, RuleVersion, Severity, State, Title         string
+	RecordOrdinal, CountAtLeast, ClearBelow, Consecutive             int
+	RatioAtLeast, ClearRatio                                         float64
+	Duration, For, ClearAfter                                        time.Duration
+	OccurredAt, EvaluatedAt                                          time.Time
+	Matched                                                          bool
+}
+
+type AnalysisHeartbeatEvidence struct {
+	DeviceID, SourceKey, EventID, RawID string
+	ObservationID                       int64
+	RecordOrdinal                       int
+	OccurredAt                          time.Time
 }
 
 type AnalysisSource struct {
@@ -245,6 +264,31 @@ func (s *RawStore) CommitAnalysisBatch(ctx context.Context, expectedCheckpoint i
 				return err
 			}
 		}
+		for _, finding := range resolution.Findings {
+			if finding.SourceKey != resolution.SourceKey || finding.DeviceID != resolution.DeviceID || finding.EventID != observation.EventID || finding.RawID != observation.RawID || finding.RecordOrdinal != observation.RecordOrdinal {
+				return fmt.Errorf("analysis finding evidence does not match observation %d", observation.ID)
+			}
+			if finding.ClearIfLatestHeartbeat {
+				var latest int64
+				if err := tx.QueryRowContext(ctx, `SELECT last_heartbeat_observation_id FROM analysis_device_telemetry WHERE device_id=?`, resolution.DeviceID).Scan(&latest); err != nil {
+					return err
+				}
+				if latest != observation.ID {
+					continue
+				}
+			}
+			if err := applyAnalysisFindingTx(ctx, tx, observation.ID, finding); err != nil {
+				return fmt.Errorf("apply analysis finding for observation %d: %w", observation.ID, err)
+			}
+		}
+		for _, sample := range resolution.WindowSamples {
+			if sample.SourceKey != resolution.SourceKey || sample.DeviceID != resolution.DeviceID || sample.EventID != observation.EventID || sample.RawID != observation.RawID || sample.RecordOrdinal != observation.RecordOrdinal {
+				return fmt.Errorf("analysis window evidence does not match observation %d", observation.ID)
+			}
+			if err := applyAnalysisWindowSampleTx(ctx, tx, observation.ID, sample); err != nil {
+				return fmt.Errorf("apply analysis window sample for observation %d: %w", observation.ID, err)
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO analysis_observation_sources(observation_id,source_key,resolution,device_id,match_method,confidence)
 			VALUES(?,?,?,?,?,?)`, observation.ID, resolution.SourceKey, resolution.Resolution, nullableString(resolution.DeviceID), resolution.MatchMethod, resolution.Confidence); err != nil {
 			return err
@@ -303,6 +347,11 @@ func upsertAnalysisDeviceTelemetry(ctx context.Context, tx *sql.Tx, observation 
 	if err != nil {
 		return fmt.Errorf("update device telemetry %s: %w", resolution.DeviceID, err)
 	}
+	if resolution.HeartbeatRule != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE analysis_device_telemetry SET last_heartbeat_observation_id=? WHERE device_id=? AND last_heartbeat_at=? AND (? > last_heartbeat_observation_id OR last_heartbeat_observation_id=0)`, observation.ID, resolution.DeviceID, at, observation.ID); err != nil {
+			return fmt.Errorf("store heartbeat evidence pointer %s: %w", resolution.DeviceID, err)
+		}
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO analysis_device_minute_buckets(device_id,bucket_start,received_count,normalized_count,quarantined_count)
 		VALUES(?,?,?,?,?) ON CONFLICT(device_id,bucket_start) DO UPDATE SET
 		received_count=analysis_device_minute_buckets.received_count+excluded.received_count,
@@ -339,6 +388,31 @@ func (s *RawStore) AnalysisStatus(ctx context.Context) (AnalysisQueueStatus, err
 		status.OldestPending = parsed
 	}
 	return status, nil
+}
+
+func (s *RawStore) ListAnalysisHeartbeatEvidence(ctx context.Context, afterDeviceID string, limit int) ([]AnalysisHeartbeatEvidence, error) {
+	if limit < 1 || limit > 512 {
+		return nil, errors.New("analysis heartbeat query limit must be between 1 and 512")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT t.device_id,aos.source_key,o.observation_id,COALESCE(o.event_id,''),o.raw_id,o.record_ordinal,o.occurred_at FROM analysis_device_telemetry t JOIN analysis_observations o ON o.observation_id=t.last_heartbeat_observation_id JOIN analysis_observation_sources aos ON aos.observation_id=o.observation_id WHERE t.heartbeat_count>0 AND t.last_heartbeat_observation_id>0 AND t.device_id>? ORDER BY t.device_id LIMIT ?`, afterDeviceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]AnalysisHeartbeatEvidence, 0)
+	for rows.Next() {
+		var item AnalysisHeartbeatEvidence
+		var at string
+		if err := rows.Scan(&item.DeviceID, &item.SourceKey, &item.ObservationID, &item.EventID, &item.RawID, &item.RecordOrdinal, &at); err != nil {
+			return nil, err
+		}
+		item.OccurredAt, err = time.Parse(time.RFC3339Nano, at)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // ListAnalysisSources pages matched, unknown, or ambiguous source identities.

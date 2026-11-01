@@ -1,0 +1,27 @@
+apiVersion: raven.io/v1
+kind: AnalysisRule
+metadata:
+  name: repeated-auth-failures
+  version: 1.0.0
+  description: Flag repeated authentication failures from the same normalized source
+spec:
+  kind: window
+  match:
+    fields:
+      - path: activity_name
+        op: eq
+        value: authentication_failure
+  window:
+    signal: event_count
+    duration: 5m
+    groupBy:
+      - src_endpoint.ip
+    countAtLeast: 5
+    clearBelow: 2
+    consecutive: 2
+  finding:
+    severity: high
+    state: yellow
+    title: Repeated authentication failures
+    for: 30s
+    clearAfter: 1m
